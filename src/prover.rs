@@ -1,58 +1,41 @@
-//SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT
 
-//! A prover is a thread that keeps up with the blockchain and generates proofs for
-//! the utreexo accumulator. Since it holds the entire accumulator, it also provides
-//! proofs for other modules. To avoid having multiple channels to and from the prover, it
-//! uses a channel to receive requests and sends responses through a oneshot channel, provided
-//! by the request sender. Maybe there is a better way to do this, but this is a TODO for later.
+//! Serial accumulator owner. Requests run between complete block commits.
+#[cfg(feature = "memory-leaf-map")]
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::RwLock;
+use std::sync::{mpsc::Sender, Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
-use anyhow::Context;
+use anyhow::{ensure, Context, Result};
 use bitcoin::consensus::serialize;
-use bitcoin::consensus::Encodable;
-use bitcoin::Block;
-use bitcoin::BlockHash;
-use bitcoin::OutPoint;
-use bitcoin::Script;
-use bitcoin::Transaction;
-use bitcoin::TxIn;
-use bitcoin::TxOut;
-#[cfg(feature = "api")]
-use bitcoin::Txid;
+use bitcoin::{Block, BlockHash, OutPoint, Script, Transaction, TxOut, Txid};
 #[cfg(feature = "api")]
 use futures::channel::mpsc::Receiver;
-use log::error;
-use log::info;
-use rustreexo::accumulator::mem_forest::MemForest;
-use rustreexo::accumulator::node_hash::BitcoinNodeHash;
-use rustreexo::accumulator::proof::Proof;
-use rustreexo::accumulator::stump::Stump;
-use serde::Deserialize;
-use serde::Serialize;
+use log::{error, info};
+use rustreexo::accumulator::{mem_forest::MemForest, proof::Proof};
+#[cfg(feature = "api")]
+use rustreexo::accumulator::{node_hash::BitcoinNodeHash, stump::Stump};
+#[cfg(feature = "api")]
+use serde::{Deserialize, Serialize};
 
-use crate::block_index::BlockIndex;
-use crate::block_index::BlocksIndex;
+use crate::block_index::{BlockIndex, BlocksIndex};
 use crate::chaininterface::Blockchain;
-use crate::chainview;
-use crate::udata::LeafContext;
-use crate::udata::LeafData;
-use crate::udata::UtreexoBlock;
+use crate::chainview::{ChainView, Delta, LeafChange, Tip};
+use crate::checkpoint::{acc_bytes, Checkpoints};
+use crate::udata::{LeafContext, LeafData, UtreexoBlock};
 
 #[cfg(not(feature = "shinigami"))]
 pub type AccumulatorHash = rustreexo::accumulator::node_hash::BitcoinNodeHash;
+#[cfg(feature = "shinigami")]
+pub type AccumulatorHash = crate::udata::shinigami_udata::PoseidonHash;
 
 pub trait BlockStorage {
     fn save_block(
         &mut self,
         block: &Block,
-        block_height: u32,
+        height: u32,
         proof: Proof<AccumulatorHash>,
         leaves: Vec<LeafContext>,
         acc: &MemForest<AccumulatorHash>,
@@ -61,585 +44,612 @@ pub trait BlockStorage {
     fn get_block(&self, index: BlockIndex) -> Option<UtreexoBlock>;
 }
 
-#[cfg(feature = "shinigami")]
-pub type AccumulatorHash = crate::udata::shinigami_udata::PoseidonHash;
-
-pub trait LeafCache: Sync + Send + Sized + 'static {
-    fn remove(&mut self, outpoint: &OutPoint) -> Option<LeafContext>;
-    fn insert(&mut self, outpoint: OutPoint, leaf_data: LeafContext) -> bool;
-    fn flush(&mut self) {}
-    #[cfg_attr(feature = "shinigami", allow(unused))]
-    fn get(&self, outpoint: &OutPoint) -> Option<LeafContext>;
-    fn cache_size(&self) -> usize {
-        0
+pub trait LeafCache {
+    fn get(&self, outpoint: &OutPoint) -> Result<Option<LeafContext>>;
+    fn apply(&mut self, changes: &[LeafChange]);
+    fn reload(&mut self, _view: &ChainView) -> Result<()> {
+        Ok(())
     }
 }
 
+#[cfg(feature = "memory-leaf-map")]
 impl LeafCache for HashMap<OutPoint, LeafContext> {
-    fn remove(&mut self, outpoint: &OutPoint) -> Option<LeafContext> {
-        self.remove(outpoint)
+    fn get(&self, outpoint: &OutPoint) -> Result<Option<LeafContext>> {
+        Ok(self.get(outpoint).cloned())
     }
-
-    fn insert(&mut self, outpoint: OutPoint, leaf_data: LeafContext) -> bool {
-        self.insert(outpoint, leaf_data);
-        false
+    fn apply(&mut self, changes: &[LeafChange]) {
+        for change in changes {
+            match &change.after {
+                Some(leaf) => {
+                    self.insert(change.outpoint, leaf.clone());
+                }
+                None => {
+                    self.remove(&change.outpoint);
+                }
+            }
+        }
     }
-
-    fn get(&self, outpoint: &OutPoint) -> Option<LeafContext> {
-        self.get(outpoint).cloned()
+    fn reload(&mut self, view: &ChainView) -> Result<()> {
+        *self = view.all_leaves()?;
+        Ok(())
     }
 }
 
-/// All the state that the prover needs to keep track of
 pub struct Prover<LeafStorage: LeafCache, Storage: BlockStorage> {
-    /// A reference to a file manager that holds the blocks on disk, using flat files.
     files: Arc<RwLock<Storage>>,
-    /// A reference to the RPC client that is used to query the blockchain.
     rpc: Box<dyn Blockchain>,
-    /// The accumulator that holds the state of the utreexo accumulator.
     acc: MemForest<AccumulatorHash>,
-    /// An index that keeps track of the blocks that are stored on disk, we need this
-    /// to get the blocks from disk.
     storage: Arc<BlocksIndex>,
-    /// The height of the blockchain we are on.
-    height: u32,
-    /// A reference to the chainview, this keeps a map of block hashes to heights and vice versa.
-    /// Also keeps block headers for easy access.
-    view: Arc<chainview::ChainView>,
-    /// A map that keeps track of the leaf data for each outpoint. This is used to generate
-    /// proofs for the utreexo accumulator. This is more like a cache, since it won't be
-    /// persisted on shutdown.
+    tip: Tip,
+    view: Arc<ChainView>,
     leaf_data: LeafStorage,
-    /// If set, we'll save a snapshot of the accumulator to disk every n blocks.
-    ///
-    /// The file will be named <height>.acc and can be used to start this software from
-    /// that height.
-    snapshot_acc_every: Option<u32>,
-    /// A flag that is set when the prover should shut down.
+    checkpoints: Checkpoints,
+    checkpoint_interval: u32,
     shutdown_flag: Arc<Mutex<bool>>,
-    /// Only save proofs for blocks older than that
-    save_proofs_for_blocks_older_than: u32,
+    save_proofs_after: u32,
     block_notification: Sender<BlockHash>,
-    ibd: bool,
 }
 
-impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage> {
-    /// Creates a new prover. It loads the accumulator from disk, if it exists.
+impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         rpc: Box<dyn Blockchain>,
-        index_database: Arc<BlocksIndex>,
-        files: Arc<RwLock<Storage>>,
-        view: Arc<chainview::ChainView>,
-        leaf_data: LeafStorage,
+        storage: Arc<BlocksIndex>,
+        files: Arc<RwLock<S>>,
+        view: Arc<ChainView>,
+        mut leaf_data: L,
         start_acc: Option<PathBuf>,
         start_height: Option<u32>,
-        snapshot_acc_every: Option<u32>,
+        checkpoint_interval: Option<u32>,
         shutdown_flag: Arc<Mutex<bool>>,
-        save_proofs_for_blocks_older_than: u32,
+        save_proofs_after: u32,
         block_notification: Sender<BlockHash>,
-    ) -> Prover<LeafStorage, Storage> {
-        let height = start_height.unwrap_or_else(|| index_database.load_height() as u32);
-        info!("Loaded height {}", height);
-        info!("Loading accumulator data...");
-        let acc = Self::try_from_disk(start_acc);
-        Self {
-            snapshot_acc_every,
+    ) -> Result<Self> {
+        ensure!(start_acc.is_none() && start_height.is_none(),
+            "legacy accumulator-only imports lack an atomic leaf index; use a fresh DATA_DIR and sync from genesis");
+        ensure!(
+            !PathBuf::from(crate::subdir("pollard")).exists(),
+            "legacy bridge storage detected; preserve it and sync using a fresh DATA_DIR"
+        );
+        let genesis = rpc.get_block_hash(0)?;
+        view.initialize(rpc.get_block_header(genesis)?)?;
+        let tip = view.tip()?.context("missing committed tip")?;
+        let checkpoints = Checkpoints::new(crate::subdir("checkpoints").into())?;
+        let acc = checkpoints.restore(&view, tip)?;
+        if tip.height == 0 {
+            checkpoints.save(&view, tip, &acc)?;
+        }
+        let checkpoint_interval = checkpoint_interval.unwrap_or(1000);
+        ensure!(
+            checkpoint_interval > 0,
+            "checkpoint interval must be positive"
+        );
+        leaf_data.reload(&view)?;
+        info!(
+            "Restored accumulator at height={} hash={}",
+            tip.height, tip.block_hash
+        );
+        Ok(Self {
             rpc,
-            acc,
-            height,
-            storage: index_database,
             files,
+            storage,
             view,
             leaf_data,
+            tip,
+            acc,
+            checkpoints,
+            checkpoint_interval,
             shutdown_flag,
-            save_proofs_for_blocks_older_than,
+            save_proofs_after,
             block_notification,
-            ibd: true,
-        }
+        })
     }
 
-    /// Tries to load the accumulator from disk. If it fails, it creates a new one.
-    fn try_from_disk(path: Option<PathBuf>) -> MemForest<AccumulatorHash> {
-        if let Some(path) = path {
-            let file = File::open(&path).unwrap();
-            let reader = BufReader::new(file);
-            match MemForest::<AccumulatorHash>::deserialize(reader) {
-                Ok(acc) => return acc,
-                Err(e) => panic!("Failed to load accumulator at {path:?}, reson: {e:?}"),
-            }
-        }
-
-        let Ok(file) = std::fs::File::open(crate::subdir("/pollard")) else {
-            return MemForest::<AccumulatorHash>::new_with_hash();
-        };
-
-        let reader = BufReader::new(file);
-        match MemForest::<AccumulatorHash>::deserialize(reader) {
-            Ok(acc) => acc,
-            Err(_) => MemForest::<AccumulatorHash>::new_with_hash(),
-        }
-    }
-
-    /// Handles the request from another module. It returns a response through the oneshot channel
-    /// provided by the request sender. Errors are returned as strings, maybe this should be changed
-    /// to a boxed error or something else.
     #[cfg(feature = "api")]
-    fn handle_request(&mut self, req: Requests) -> anyhow::Result<Responses> {
-        use bitcoin::ScriptBuf;
-        use bitcoin::Sequence;
-        use bitcoin::Witness;
-
-        match req {
-            Requests::GetProof(node) => {
-                let proof = self
-                    .acc
-                    .prove(&[node])
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-                Ok(Responses::Proof(proof))
-            }
-            Requests::GetRoots => {
-                let roots = self.acc.get_roots().iter().map(|x| x.get_data()).collect();
-                Ok(Responses::Roots(roots))
-            }
-            Requests::GetLeaf(outpoint) => {
-                let leaf = self.leaf_data.get(&outpoint).ok_or(anyhow::anyhow!(
-                    "Leaf for outpoint {}:{} not found",
-                    outpoint.txid,
-                    outpoint.vout
-                ))?;
-
-                Ok(Responses::LeafData(leaf))
-            }
-            Requests::GetBlockByHeight(height) => {
-                let hash = self
-                    .rpc
-                    .get_block_hash(height as u64)
-                    .map_err(|_| anyhow::anyhow!("Block at height {} not found", height))?;
-                let block = self.storage.get_index(hash).ok_or(anyhow::anyhow!(
-                    "Block at height {} not found in storage",
-                    height
-                ))?;
-
-                let block = self
-                    .files
-                    .read()
-                    .unwrap()
-                    .get_block(block)
-                    .ok_or(anyhow::anyhow!(
-                        "Block at height {} not found in files",
-                        height
-                    ))?;
-                Ok(Responses::Block(serialize(&block)))
-            }
-            Requests::GetTxUnpent(txid) => {
-                // returns the unspent outputs of a transaction and a proof for them
-                let tx = self
-                    .rpc
-                    .get_transaction(txid)
-                    .map_err(|_| anyhow::anyhow!("Transaction {} not found", txid))?;
-
-                let mut hashes = Vec::new();
-                for vout in 0..tx.output.len() {
-                    let (hash, _) = self.get_input_leaf_hash(&TxIn {
-                        previous_output: OutPoint {
-                            txid,
-                            vout: vout as u32,
-                        },
-                        script_sig: ScriptBuf::new(),
-                        sequence: Sequence::ZERO,
-                        witness: Witness::new(),
-                    })?;
-
-                    // if this returns err, this output is spent
-                    if self.acc.prove(&[hash]).is_ok() {
-                        hashes.push(hash);
-                    }
-                }
-
-                let proof = self
-                    .acc
-                    .prove(&hashes)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-                Ok(Responses::TransactionOut(tx.output, proof))
-            }
-            Requests::GetTransaction(txid) => {
-                // returns the unspent outputs of a transaction and a proof for them
-                let tx = self
-                    .rpc
-                    .get_transaction(txid)
-                    .map_err(|_| anyhow::anyhow!("Transaction {} not found", txid))?;
-
-                let mut hashes = Vec::new();
-                for vout in 0..tx.output.len() {
-                    let (hash, _) = self.get_input_leaf_hash(&TxIn {
-                        previous_output: OutPoint {
-                            txid,
-                            vout: vout as u32,
-                        },
-                        script_sig: ScriptBuf::new(),
-                        sequence: Sequence::ZERO,
-                        witness: Witness::new(),
-                    })?;
-
-                    hashes.push(hash);
-                }
-
-                let proof = self
-                    .acc
-                    .prove(&hashes)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-                Ok(Responses::Transaction((tx, proof)))
-            }
-            Requests::GetCSN => {
-                let roots = self.acc.get_roots().iter().map(|x| x.get_data()).collect();
-                let leaves = self.acc.leaves;
-                Ok(Responses::Csn(Stump { roots, leaves }))
-            }
+    fn handle_request(&mut self, request: Requests) -> Result<Responses> {
+        match request {
+            Requests::GetProof(hash) => Ok(Responses::Proof(
+                self.acc.prove(&[hash]).map_err(anyhow::Error::msg)?,
+            )),
+            Requests::GetRoots => Ok(Responses::Roots(
+                self.acc.get_roots().iter().map(|r| r.get_data()).collect(),
+            )),
+            Requests::GetCSN => Ok(Responses::Csn(Stump {
+                leaves: self.acc.leaves,
+                roots: self.acc.get_roots().iter().map(|r| r.get_data()).collect(),
+            })),
+            Requests::GetLeaf(outpoint) => Ok(Responses::LeafData(self.lookup_leaf(&outpoint)?)),
+            Requests::GetBlockByHeight(height) => Ok(Responses::Block(self.block_at(height)?)),
             Requests::GetBlocksByHeight(height, count) => {
+                ensure!(count <= 16, "at most 16 blocks per request");
+                let end = height.checked_add(count).context("height overflow")?;
                 let mut blocks = Vec::new();
-                for i in height..height + count {
-                    let Some(hash) = self.view.get_block_hash(i)? else {
+                for h in height..end {
+                    if h > self.tip.height {
                         break;
-                    };
-                    let block = self.storage.get_index(hash).ok_or(anyhow::anyhow!(
-                        "Block at height {} not found in storage",
-                        i
-                    ))?;
-
-                    let block = self
-                        .files
-                        .read()
-                        .unwrap()
-                        .get_block(block)
-                        .ok_or(anyhow::anyhow!("Block at height {} not found in files", i))?;
-                    blocks.push(serialize(&block));
+                    }
+                    blocks.push(self.block_at(h)?);
                 }
                 Ok(Responses::Blocks(blocks))
             }
+            Requests::GetTransaction(txid) | Requests::GetTxUnpent(txid) => {
+                let only_unspent = matches!(request, Requests::GetTxUnpent(_));
+                let tx = self.rpc.get_transaction(txid)?;
+                let mut hashes = Vec::new();
+                let mut outputs = Vec::new();
+                for (vout, output) in tx.output.iter().enumerate() {
+                    let outpoint = OutPoint {
+                        txid,
+                        vout: vout as u32,
+                    };
+                    if let Some(leaf) = self.leaf_data.get(&outpoint)? {
+                        hashes.push(LeafData::get_leaf_hashes(&leaf));
+                        outputs.push(output.clone());
+                    } else if !only_unspent {
+                        anyhow::bail!(
+                            "output {outpoint} is not unspent at {}",
+                            self.tip.block_hash
+                        );
+                    }
+                }
+                let proof = self.acc.prove(&hashes).map_err(anyhow::Error::msg)?;
+                if only_unspent {
+                    Ok(Responses::TransactionOut(outputs, proof))
+                } else {
+                    Ok(Responses::Transaction((tx, proof)))
+                }
+            }
         }
     }
 
-    /// Gracefully shuts down the prover. It saves the accumulator to disk and flushes the chainview.
-    fn shutdown(&mut self) {
-        self.save_to_disk(None)
-            .expect("could not save the acc to disk");
-        self.leaf_data.flush();
-        self.view.flush();
+    fn lookup_leaf(&self, outpoint: &OutPoint) -> Result<LeafContext> {
+        self.leaf_data.get(outpoint)?.with_context(|| {
+            format!(
+                "outpoint {outpoint} is not unspent at {}",
+                self.tip.block_hash
+            )
+        })
     }
 
-    /// Saves the accumulator to disk. This is done by serializing the accumulator to a file,
-    /// the serialization is done by the rustreexo library and is a depth first traversal of the
-    /// tree.
-    fn save_to_disk(&self, height: Option<u32>) -> std::io::Result<()> {
-        let file = match height {
-            Some(height) => std::fs::File::create(crate::subdir(&format!("{}.acc", height)))?,
-            None => std::fs::File::create(crate::subdir("/pollard"))?,
-        };
-
-        let mut writer = std::io::BufWriter::new(file);
-        self.acc.serialize(&mut writer).unwrap();
-
-        Ok(())
+    #[cfg(feature = "api")]
+    fn block_at(&self, height: u32) -> Result<Vec<u8>> {
+        ensure!(height <= self.tip.height, "block is ahead of processed tip");
+        let hash = self
+            .view
+            .get_block_hash(height)?
+            .context("unknown block height")?;
+        let index = self
+            .storage
+            .get_index(hash)
+            .context("block proof is unavailable")?;
+        let block = self
+            .files
+            .read()
+            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?
+            .get_block(index)
+            .context("block proof is unavailable")?;
+        Ok(serialize(&block))
     }
 
-    /// A infinite loop that keeps the prover up to date with the blockchain. It handles requests
-    /// from other modules and updates the accumulator when a new block is found. This method is
-    /// also how we create proofs for historical blocks.
     pub fn keep_up(
         &mut self,
         #[cfg(feature = "api")] mut receiver: Receiver<(
             Requests,
             futures::channel::oneshot::Sender<Result<Responses, String>>,
         )>,
-    ) -> anyhow::Result<()> {
-        let mut last_tip_update = std::time::Instant::now();
+    ) -> Result<()> {
+        let mut target = self.tip.height;
+        let mut next_poll = Instant::now();
         loop {
             if *self.shutdown_flag.lock().unwrap() {
-                info!("Shutting down prover");
-                self.shutdown();
-                break;
+                self.view.flush()?;
+                return Ok(());
             }
-
             #[cfg(feature = "api")]
-            while let Ok(Some((req, res))) = receiver.try_next() {
-                let ret = self.handle_request(req).map_err(|e| e.to_string());
-                res.send(ret)
-                    .map_err(|_| anyhow::anyhow!("Error sending response"))?;
+            for _ in 0..32 {
+                let Ok(Some((request, response))) = receiver.try_next() else {
+                    break;
+                };
+                // A disconnected HTTP client must not terminate the prover.
+                let _ = response.send(self.handle_request(request).map_err(|e| e.to_string()));
             }
-
-            if last_tip_update.elapsed() >= std::time::Duration::from_secs(10) {
-                let result = self.check_tip();
-                // Wait between attempts even when the tip is unchanged or the backend fails.
-                last_tip_update = std::time::Instant::now();
-                if let Err(e) = result {
-                    error!("Error checking tip: {}", e);
+            if Instant::now() >= next_poll {
+                next_poll = Instant::now() + Duration::from_secs(10);
+                match self.rpc.get_block_count() {
+                    Ok(height) => {
+                        target = u32::try_from(height)?;
+                        self.reconcile(target)?;
+                    }
+                    Err(e) => {
+                        error!("Backend tip unavailable: {e}");
+                        target = self.tip.height;
+                    }
                 }
             }
-
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            if self.tip.height < target {
+                let height = self.tip.height + 1;
+                let fetched = self.rpc.get_block_hash(u64::from(height)).and_then(|hash| {
+                    let block = self.rpc.get_block(hash)?;
+                    ensure!(block.block_hash() == hash, "backend returned wrong block");
+                    Ok(block)
+                });
+                let block = match fetched {
+                    Ok(block) => block,
+                    Err(e) => {
+                        error!("Backend block unavailable: {e}");
+                        target = self.tip.height;
+                        continue;
+                    }
+                };
+                if block.header.prev_blockhash != self.tip.block_hash {
+                    next_poll = Instant::now();
+                    target = self.tip.height;
+                    continue;
+                }
+                let mtp = self.rpc.get_mtp(self.tip.block_hash)?;
+                self.connect_block(&block, mtp)?;
+                if self.tip.height == target {
+                    let _ = self.block_notification.send(self.tip.block_hash);
+                    self.view.flush()?;
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
-        self.save_to_disk(None)
-            .expect("could not save the acc to disk");
-        self.storage.update_height(self.height as usize);
-        Ok(())
     }
 
-    fn check_tip(&mut self) -> anyhow::Result<()> {
-        let height = self.rpc.get_block_count()? as u32;
-        if height == self.height {
-            self.ibd = false; // we'll flip it once, and keep it false for the rest of the time
+    /// Detect longer, equal-height and rollback-only reorganizations by hash.
+    fn reconcile(&mut self, backend_height: u32) -> Result<()> {
+        let mut height = self.tip.height.min(backend_height);
+        while self.view.get_block_hash(height)? != Some(self.rpc.get_block_hash(u64::from(height))?)
+        {
+            ensure!(height > 0, "backend genesis changed");
+            height -= 1;
+        }
+        if height == self.tip.height {
             return Ok(());
         }
-
-        if height > self.height {
-            self.prove_range(self.height + 1, height)?;
-
-            self.save_to_disk(None)
-                .expect("could not save the acc to disk");
-            self.storage.update_height(height as usize);
+        let ancestor = Tip {
+            height,
+            block_hash: self
+                .view
+                .get_block_hash(height)?
+                .context("missing ancestor")?,
+        };
+        // Check recovery coverage before modifying the committed chain.
+        let acc = self.checkpoints.restore(&self.view, ancestor)?;
+        for disconnect in height + 1..=self.tip.height {
+            let delta = self.view.delta(disconnect)?.context(
+                "reorg exceeds retained recovery journal; rebuild with a fresh DATA_DIR",
+            )?;
+            ensure!(
+                self.view.get_block_hash(disconnect)? == Some(delta.tip.block_hash)
+                    && self.view.get_block_hash(disconnect - 1)? == Some(delta.parent),
+                "recovery journal identity mismatch"
+            );
         }
+        info!("Reorganizing from {} to {}", self.tip.height, height);
+        while self.view.tip()?.context("missing tip")?.height > height {
+            self.view.undo_tip()?;
+        }
+        self.view.flush()?;
+        self.checkpoints.discard_after(&self.view, height)?;
+        self.tip = ancestor;
+        self.acc = acc;
+        self.leaf_data.reload(&self.view)?;
         Ok(())
     }
 
-    /// Proves a range of blocks, may be just one block.
-    pub fn prove_range(&mut self, start: u32, end: u32) -> anyhow::Result<()> {
-        for height in start..=end {
-            if *self.shutdown_flag.lock().unwrap() {
-                break;
-            }
-
-            let block_hash = self.rpc.get_block_hash(height as u64)?;
-            // Update the local index
-            self.view.save_block_hash(height, block_hash)?;
-            self.view.save_height(block_hash, height)?;
-
-            let block = self.rpc.get_block(block_hash)?;
-
-            self.view
-                .save_header(block_hash, serialize(&block.header))?;
-
-            info!(
-                "processing height={} cache={} txs={}",
-                height,
-                self.leaf_data.cache_size(),
-                block.txdata.len()
-            );
-
-            let mtp = self.rpc.get_mtp(block.header.prev_blockhash)?;
-            let (proof, leaves) = match self.process_block(&block, height, mtp) {
-                Ok((proof, leaves)) => (proof, leaves),
-                Err(e) => {
-                    error!("Couldn't process block {block_hash} due to {e:?}");
-                    return Ok(());
-                }
-            };
-
-            if height > self.save_proofs_for_blocks_older_than {
-                let index = self
-                    .files
-                    .write()
-                    .unwrap()
-                    .save_block(&block, height, proof, leaves, &self.acc);
-                self.storage.append(index, block.block_hash());
-            }
-
-            self.height = height;
-            if let Some(n) = self.snapshot_acc_every {
-                if height % n == 0 {
-                    self.save_to_disk(Some(height))
-                        .expect("could not save the acc to disk");
-                }
-            }
-
-            if !self.ibd {
-                // only notify when we're not in IBD
-                self.block_notification.send(block.block_hash()).unwrap();
-            }
+    fn connect_block(&mut self, block: &Block, mtp: u32) -> Result<()> {
+        ensure!(
+            block.header.prev_blockhash == self.tip.block_hash,
+            "block parent mismatch"
+        );
+        let delta = self.prepare(block, mtp)?;
+        let adds = delta
+            .adds
+            .iter()
+            .map(LeafData::get_leaf_hashes)
+            .collect::<Vec<_>>();
+        let dels = delta
+            .dels
+            .iter()
+            .map(LeafData::get_leaf_hashes)
+            .collect::<Vec<_>>();
+        let proof = self.acc.prove(&dels).map_err(anyhow::Error::msg)?;
+        self.acc.modify(&adds, &dels).map_err(anyhow::Error::msg)?;
+        if delta.tip.height > self.save_proofs_after {
+            let index = self
+                .files
+                .write()
+                .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?
+                .save_block(
+                    block,
+                    delta.tip.height,
+                    proof,
+                    delta.dels.clone(),
+                    &self.acc,
+                );
+            self.storage.append(index, delta.tip.block_hash);
         }
-
-        anyhow::Ok(())
+        // Any error after forest modification is fatal to this process. Restart
+        // reconstructs from the committed DB and never checkpoints partial work.
+        self.view
+            .commit(&delta, &block.header, &acc_bytes(&self.acc))?;
+        self.leaf_data.apply(&delta.changes);
+        self.tip = delta.tip;
+        self.storage.update_height(self.tip.height as usize);
+        if self.tip.height % self.checkpoint_interval == 0 {
+            self.checkpoints.save(&self.view, self.tip, &self.acc)?;
+        }
+        info!(
+            "processed height={} txs={}",
+            self.tip.height,
+            block.txdata.len()
+        );
+        Ok(())
     }
 
-    /// Pulls the [LeafData] from the bitcoin core rpc. We use this as fallback if we can't find
-    /// the leaf in leaf_data. This method is slow and should only be used if we can't find the
-    /// leaf in the leaf_data.
-    fn get_input_leaf_hash_from_rpc(
-        rpc: &Box<dyn Blockchain>,
-        input: &TxIn,
-    ) -> anyhow::Result<LeafContext> {
-        let tx_info = rpc.get_raw_transaction_info(&input.previous_output.txid)?;
-
-        let Some(block_hash) = tx_info.blockhash else {
-            return Err(anyhow::anyhow!(
-                "Transaction wasn't confirmed yet, so there's no leaf hash"
-            ));
+    /// Stage leaf changes without touching persistent or accumulator state.
+    fn prepare(&self, block: &Block, mtp: u32) -> Result<Delta> {
+        let tip = Tip {
+            height: self.tip.height.checked_add(1).context("height overflow")?,
+            block_hash: block.block_hash(),
         };
-
-        let height = tx_info.height;
-        let output = &tx_info.tx.output[input.previous_output.vout as usize];
-        let prev_block = rpc
-            .get_block_header(block_hash)
-            .context("Failed to get block header")?
-            .prev_blockhash;
-
-        let median_time_past = rpc
-            .get_mtp(prev_block)
-            .context("Failed to get median time past")?;
-
-        Ok(LeafContext {
-            block_hash,
-            median_time_past,
-            block_height: height,
-            is_coinbase: tx_info.is_coinbase,
-            pk_script: output.script_pubkey.clone(),
-            value: output.value.to_sat(),
-            vout: input.previous_output.vout,
-            txid: input.previous_output.txid,
+        let mut changes: BTreeMap<OutPoint, LeafChange> = BTreeMap::new();
+        let mut created = Vec::new();
+        let mut consumed = HashSet::new();
+        let mut spent = HashSet::new();
+        let mut dels = Vec::new();
+        for tx in &block.txdata {
+            if !tx.is_coinbase() {
+                for input in &tx.input {
+                    let op = input.previous_output;
+                    ensure!(spent.insert(op), "duplicate spend in backend block");
+                    let leaf = match changes.get(&op) {
+                        Some(change) => change.after.clone().context("already spent in block")?,
+                        None => self.lookup_leaf(&op)?,
+                    };
+                    if leaf.block_hash == tip.block_hash {
+                        consumed.insert(op);
+                    } else {
+                        dels.push(leaf.clone());
+                    }
+                    changes
+                        .entry(op)
+                        .or_insert(LeafChange {
+                            outpoint: op,
+                            before: Some(leaf),
+                            after: None,
+                        })
+                        .after = None;
+                }
+            }
+            let txid = tx.compute_txid();
+            for (vout, output) in tx.output.iter().enumerate() {
+                if Self::is_unspendable(&output.script_pubkey) {
+                    continue;
+                }
+                let op = OutPoint {
+                    txid,
+                    vout: vout as u32,
+                };
+                let leaf = LeafContext {
+                    block_hash: tip.block_hash,
+                    txid,
+                    vout: op.vout,
+                    value: output.value.to_sat(),
+                    pk_script: output.script_pubkey.clone(),
+                    block_height: tip.height,
+                    median_time_past: mtp,
+                    is_coinbase: tx.is_coinbase(),
+                };
+                let before = self.leaf_data.get(&op)?;
+                // BIP30's two historical overwrites leave the original
+                // block-bound hash in Utreexo, but replace the outpoint index.
+                changes
+                    .entry(op)
+                    .or_insert(LeafChange {
+                        outpoint: op,
+                        before,
+                        after: None,
+                    })
+                    .after = Some(leaf.clone());
+                created.push((op, leaf));
+            }
+        }
+        let adds = created
+            .into_iter()
+            .filter(|(op, _)| !consumed.contains(op))
+            .map(|(_, leaf)| leaf)
+            .collect();
+        Ok(Delta {
+            tip,
+            parent: self.tip.block_hash,
+            adds,
+            dels,
+            changes: changes.into_values().collect(),
         })
     }
 
-    /// Returns the leaf hash and the compact leaf data for a given input. If the leaf is not in
-    /// leaf_data we will try to get it from the bitcoin core rpc.
-    fn get_input_leaf_hash(
-        &mut self,
-        input: &TxIn,
-    ) -> anyhow::Result<(AccumulatorHash, LeafContext)> {
-        let leaf = self.leaf_data.remove(&input.previous_output);
-
-        let leaf = match leaf {
-            Some(leaf) => leaf,
-            None => Self::get_input_leaf_hash_from_rpc(&self.rpc, input)
-                .context("[get_input_leaf_hash] Failure to get leaf hash")?,
-        };
-
-        Ok((LeafData::get_leaf_hashes(&leaf), leaf))
-    }
-
     fn is_unspendable(script: &Script) -> bool {
-        if script.len() > 10_000 {
-            return true;
-        }
-
-        if !script.is_empty() && script.as_bytes()[0] == 0x6a {
-            return true;
-        }
-
-        false
-    }
-
-    /// Processes a block and returns the batch proof and the compact leaf data for the block.
-    fn process_block(
-        &mut self,
-        block: &Block,
-        height: u32,
-        mtp: u32,
-    ) -> anyhow::Result<(Proof<AccumulatorHash>, Vec<LeafContext>)> {
-        let mut inputs = Vec::new();
-        let mut utxos = Vec::new();
-        let mut compact_leaves = Vec::new();
-
-        for tx in block.txdata.iter() {
-            let txid = tx.compute_txid();
-            for input in tx.input.iter() {
-                if !tx.is_coinbase() {
-                    let (hash, compact_leaf) = self.get_input_leaf_hash(input)?;
-                    if let Some(idx) = utxos.iter().position(|h| *h == hash) {
-                        utxos.remove(idx);
-                    } else {
-                        inputs.push(hash);
-                        compact_leaves.push(compact_leaf);
-                    }
-                }
-            }
-
-            for (idx, output) in tx.output.iter().enumerate() {
-                if !Self::is_unspendable(&output.script_pubkey) {
-                    let leaf = LeafContext {
-                        block_hash: block.block_hash(),
-                        median_time_past: mtp,
-                        txid,
-                        vout: idx as u32,
-                        value: output.value.to_sat(),
-                        pk_script: output.script_pubkey.clone(),
-                        is_coinbase: tx.is_coinbase(),
-                        block_height: height,
-                    };
-
-                    utxos.push(LeafData::get_leaf_hashes(&leaf));
-
-                    let flush = self.leaf_data.insert(
-                        OutPoint {
-                            txid,
-                            vout: idx as u32,
-                        },
-                        leaf,
-                    );
-
-                    if flush {
-                        self.leaf_data.flush();
-                        self.save_to_disk(None)
-                            .expect("could not save the acc to disk");
-                        self.storage.update_height(self.height as usize);
-                    }
-                }
-            }
-        }
-
-        let proof = self.acc.prove(&inputs).unwrap();
-        self.acc.modify(&utxos, &inputs).unwrap();
-
-        let mut ser_acc = Vec::new();
-
-        self.acc.leaves.consensus_encode(&mut ser_acc).unwrap();
-        self.acc.get_roots().iter().for_each(|x| {
-            x.get_data().consensus_encode(&mut ser_acc).unwrap();
-        });
-
-        self.view.save_acc(ser_acc, block.block_hash());
-
-        Ok((proof, compact_leaves))
+        script.len() > 10_000 || script.as_bytes().first() == Some(&0x6a)
     }
 }
 
 #[cfg(feature = "api")]
-/// All requests we can send to the prover. The prover will respond with the corresponding
-/// response element.
 pub enum Requests {
-    /// Get the proof for a given leaf hash.
     GetProof(BitcoinNodeHash),
-    /// Get the roots of the accumulator.
     GetRoots,
-    /// Get a block at a given height. This method returns the block and utreexo data for it.
     GetBlockByHeight(u32),
-    /// Returns a transaction and a proof for all inputs
     GetTransaction(Txid),
-    /// Returns the CSN of the current acc
     GetCSN,
-    /// Returns multiple blocks and utreexo data for them.
     GetBlocksByHeight(u32, u32),
     GetTxUnpent(Txid),
     GetLeaf(OutPoint),
 }
-/// All responses the prover will send.
+
+#[cfg(feature = "api")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Responses {
-    /// A utreexo proof
     Proof(Proof),
-    /// The roots of the accumulator
     Roots(Vec<BitcoinNodeHash>),
-    /// A block and the utreexo data for it, serialized.
     Block(Vec<u8>),
-    /// A transaction and a proof for all **outputs**
     Transaction((Transaction, Proof)),
-    /// The CSN of the current acc
-    #[allow(clippy::upper_case_acronyms)]
     Csn(Stump),
-    /// Multiple blocks and utreexo data for them.
     Blocks(Vec<Vec<u8>>),
     TransactionOut(Vec<TxOut>, Proof),
     LeafData(LeafContext),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::leaf_cache::DiskLeafStorage;
+    use crate::test_support::{block, outpoint, store, transaction, TestChain, TestDir};
+
+    struct NoBlocks;
+    impl BlockStorage for NoBlocks {
+        fn save_block(
+            &mut self,
+            _: &Block,
+            _: u32,
+            _: Proof<AccumulatorHash>,
+            _: Vec<LeafContext>,
+            _: &MemForest<AccumulatorHash>,
+        ) -> BlockIndex {
+            BlockIndex { offset: 0, size: 0 }
+        }
+        fn get_block(&self, _: BlockIndex) -> Option<UtreexoBlock> {
+            None
+        }
+    }
+
+    fn prover(dir: &TestDir, chain: &TestChain) -> Prover<DiskLeafStorage, NoBlocks> {
+        let view = Arc::new(ChainView::new(store(&dir.join("chain"))));
+        view.initialize(chain.0.read().unwrap()[0].header).unwrap();
+        let tip = view.tip().unwrap().unwrap();
+        let checkpoints = Checkpoints::new(dir.join("checkpoints")).unwrap();
+        let acc = checkpoints.restore(&view, tip).unwrap();
+        if tip.height == 0 {
+            checkpoints.save(&view, tip, &acc).unwrap();
+        }
+        Prover {
+            rpc: Box::new(chain.clone()),
+            files: Arc::new(RwLock::new(NoBlocks)),
+            storage: Arc::new(BlocksIndex {
+                database: store(&dir.join("index")),
+            }),
+            acc,
+            tip,
+            leaf_data: DiskLeafStorage::new(view.clone()),
+            view,
+            checkpoints,
+            checkpoint_interval: 2,
+            shutdown_flag: Arc::new(Mutex::new(false)),
+            save_proofs_after: u32::MAX,
+            block_notification: std::sync::mpsc::channel().0,
+        }
+    }
+
+    #[test]
+    fn restart_reorg_and_read_only_queries_preserve_membership() {
+        let dir = TestDir::new();
+        let chain = TestChain::new();
+        let genesis = chain.0.read().unwrap()[0].clone();
+        let first = block(&genesis, 1, vec![]);
+        let coin = outpoint(&first.txdata[0]);
+        let mut p = prover(&dir, &chain);
+        chain.0.write().unwrap().push(first.clone());
+        p.connect_block(&first, 0).unwrap();
+        let leaf = p.lookup_leaf(&coin).unwrap();
+        let hash = LeafData::get_leaf_hashes(&leaf);
+        let old_proof = p.acc.prove(&[hash]).unwrap();
+        let old_roots = p.view.get_acc(p.tip.block_hash).unwrap().unwrap();
+        #[cfg(feature = "api")]
+        for _ in 0..3 {
+            p.handle_request(Requests::GetTransaction(coin.txid))
+                .unwrap();
+            p.handle_request(Requests::GetTxUnpent(coin.txid)).unwrap();
+            assert_eq!(p.lookup_leaf(&coin).unwrap(), leaf);
+        }
+        let second = block(&first, 2, vec![transaction(coin, 20)]);
+        chain.0.write().unwrap().push(second.clone());
+        p.connect_block(&second, 0).unwrap(); // checkpoint
+        assert!(p.lookup_leaf(&coin).is_err());
+        let third = block(&second, 3, vec![]);
+        chain.0.write().unwrap().push(third.clone());
+        p.connect_block(&third, 0).unwrap(); // journal only
+        let expected = acc_bytes(&p.acc);
+        p.view.flush().unwrap();
+        drop(p); // no shutdown snapshot
+        let mut p = prover(&dir, &chain);
+        assert_eq!(p.tip.block_hash, third.block_hash());
+        assert_eq!(acc_bytes(&p.acc), expected);
+        assert_eq!(
+            p.view.get_acc(first.block_hash()).unwrap().unwrap(),
+            old_roots
+        );
+        let past = p
+            .checkpoints
+            .restore(
+                &p.view,
+                Tip {
+                    height: 1,
+                    block_hash: first.block_hash(),
+                },
+            )
+            .unwrap();
+        assert!(past.verify(&old_proof, &[hash]).unwrap()); // valid even after spend
+
+        // Replace the tip without increasing the backend height.
+        let replacement = block(&second, 4, vec![]);
+        chain.0.write().unwrap()[3] = replacement.clone();
+        p.reconcile(3).unwrap();
+        assert_eq!(p.tip.block_hash, second.block_hash());
+        p.connect_block(&replacement, 0).unwrap();
+        assert!(p.view.active_tip_for(third.block_hash()).unwrap().is_none());
+
+        // A rollback below the most recent checkpoint restores the spent coin.
+        chain.0.write().unwrap().truncate(2);
+        p.reconcile(1).unwrap();
+        assert_eq!(p.lookup_leaf(&coin).unwrap(), leaf);
+        assert!(p.acc.verify(&old_proof, &[hash]).unwrap());
+    }
+
+    #[test]
+    fn same_block_spends_are_excluded_and_recovery_is_bounded() {
+        let dir = TestDir::new();
+        let chain = TestChain::new();
+        let mut p = prover(&dir, &chain);
+        let mut parent = chain.0.read().unwrap()[0].clone();
+        let first = block(&parent, 1, vec![]);
+        p.connect_block(&first, 0).unwrap();
+        let created = transaction(outpoint(&first.txdata[0]), 10);
+        let consumed = outpoint(&created);
+        let second = block(&first, 2, vec![created, transaction(consumed, 11)]);
+        p.connect_block(&second, 0).unwrap();
+        assert!(p.lookup_leaf(&consumed).is_err());
+        assert_eq!(p.acc.leaves, 3); // first coinbase, second coinbase, final output
+        parent = second;
+        for height in 3..=6 {
+            let next = block(&parent, height, vec![]);
+            p.connect_block(&next, 0).unwrap();
+            parent = next;
+        }
+        assert!(p.view.delta(4).unwrap().is_none());
+        assert!(p.view.delta(5).unwrap().is_some());
+        assert_eq!(
+            std::fs::read_dir(dir.join("checkpoints")).unwrap().count(),
+            2
+        );
+        assert!(p.view.get_acc(first.block_hash()).unwrap().is_some());
+        let before = p.tip;
+        assert!(p.reconcile(0).is_err()); // fails before modifying the active tip
+        assert_eq!(p.view.tip().unwrap(), Some(before));
+        assert_eq!(
+            acc_bytes(&p.checkpoints.restore(&p.view, p.tip).unwrap()),
+            acc_bytes(&p.acc)
+        );
+    }
 }

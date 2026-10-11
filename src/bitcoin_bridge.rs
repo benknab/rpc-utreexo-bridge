@@ -6,7 +6,6 @@ use std::sync::RwLock;
 
 use actix_rt::signal::ctrl_c;
 use anyhow::Context;
-use bitcoin::consensus::serialize;
 use bitcoin::constants::genesis_block;
 use clap::Parser;
 use futures::channel::mpsc::channel;
@@ -60,12 +59,7 @@ pub fn run_bridge() -> anyhow::Result<()> {
     let network = cli_options.network;
     let genesis = genesis_block(network);
 
-    if view.get_height(genesis.block_hash()).is_err() {
-        view.save_header(genesis.block_hash(), serialize(&genesis.header))
-            .expect("Failed to save genesis header");
-        view.save_height(genesis.header.block_hash(), 0)
-            .expect("Failed to save genesis height");
-    }
+    view.initialize(genesis.header)?;
 
     // This database stores some useful information about the blocks, but not
     // the blocks themselves
@@ -95,11 +89,15 @@ pub fn run_bridge() -> anyhow::Result<()> {
     // implementing the [Blockchain] trait, for example a bitcoin core node or an esplora
     // instance.
     let client = get_chain_provider()?;
+    anyhow::ensure!(
+        client.get_block_hash(0)? == genesis.block_hash(),
+        "backend network differs from --network"
+    );
 
     // Create a prover, this module will download blocks from the bitcoin core
     // node and save them to disk. It will also create proofs for the blocks
     // and save them to disk.
-    let leaf_data = DiskLeafStorage::new(&subdir("leaf_data"));
+    let leaf_data = DiskLeafStorage::new(view.clone());
 
     // a signal used to stop the prover
     let kill_signal = Arc::new(Mutex::new(false));
@@ -120,7 +118,7 @@ pub fn run_bridge() -> anyhow::Result<()> {
         kill_signal.clone(),
         cli_options.save_proofs_after.unwrap_or(0),
         block_notifier_tx,
-    );
+    )?;
 
     info!("Starting P2PV2-only BIP 183 proof server");
 

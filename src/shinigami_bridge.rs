@@ -81,12 +81,18 @@ pub fn run_bridge() -> anyhow::Result<()> {
     // implementing the [Blockchain] trait, for example a bitcoin core node or an esplora
     // instance.
     let client = get_chain_provider()?;
+    let genesis = bitcoin::constants::genesis_block(cli_options.network);
+    anyhow::ensure!(
+        client.get_block_hash(0)? == genesis.block_hash(),
+        "backend network differs from --network"
+    );
+    view.initialize(genesis.header)?;
 
     // Create a prover, this module will download blocks from the bitcoin core
     // node and save them to disk. It will also create proofs for the blocks
     // and save them to disk.
     #[cfg(not(feature = "memory-leaf-map"))]
-    let leaf_data = DiskLeafStorage::new(&subdir("leaf_data"));
+    let leaf_data = DiskLeafStorage::new(view.clone());
 
     #[cfg(feature = "memory-leaf-map")]
     let leaf_data = HashMap::new();
@@ -105,7 +111,7 @@ pub fn run_bridge() -> anyhow::Result<()> {
         kill_signal.clone(),
         cli_options.save_proofs_after.unwrap_or(0),
         sender,
-    );
+    )?;
 
     // Keep the prover running in the background, it will download blocks and
     // create proofs for them as they are mined.

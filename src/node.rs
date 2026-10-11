@@ -1510,7 +1510,11 @@ impl Peer {
                     sender: version.receiver,
                     nonce: version.nonce.wrapping_add(100),
                     user_agent: "/bridge:0.1.3/".to_string(),
-                    start_height: self.context.proof_index.load_height() as i32,
+                    start_height: self
+                        .context
+                        .chainview
+                        .tip()?
+                        .map_or(0, |tip| tip.height as i32),
                     relay: false,
                 }))?;
                 self.send_message(NetworkMessage::Verack)?;
@@ -1620,10 +1624,16 @@ impl Peer {
                 request.locator_hashes.len() as u64,
             ));
         }
+        let _guard = self
+            .context
+            .chainview
+            .gate
+            .read()
+            .map_err(|_| PeerError::PoisonedProofBackend)?;
         let mut common_height = 0;
         for block_hash in &request.locator_hashes {
-            if let Some(height) = self.context.chainview.get_height(*block_hash)? {
-                common_height = height;
+            if let Some(tip) = self.context.chainview.active_tip_for(*block_hash)? {
+                common_height = tip.height;
                 break;
             }
         }
@@ -2006,7 +2016,7 @@ enum PeerError {
     ProofBitmapTooLarge,
     Protocol(bip324::Error),
     RateLimitExceeded,
-    Storage(kv::Error),
+    Storage(anyhow::Error),
     TooManyInventoryItems(u64),
     TooManyLocatorHashes(u64),
     TooManyHandshakePackets(usize),
@@ -2095,6 +2105,12 @@ impl From<std::io::Error> for PeerError {
 
 impl From<kv::Error> for PeerError {
     fn from(error: kv::Error) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+impl From<anyhow::Error> for PeerError {
+    fn from(error: anyhow::Error) -> Self {
         Self::Storage(error)
     }
 }

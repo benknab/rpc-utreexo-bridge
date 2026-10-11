@@ -3,19 +3,13 @@ use clap::Parser;
 
 #[derive(Debug, Parser)]
 pub struct CliArgs {
-    /// If you want to run the bridge from a specific height, you can specify it here.
-    ///
-    /// Notice that this requires passing the initial state path, that should point to a valid
-    /// accumulator state at the specified height.
+    /// Legacy snapshot height (unsupported: rebuild in a fresh DATA_DIR).
     #[clap(long, requires("initial_state_path"))]
     pub start_height: Option<u32>,
-    /// The path to the initial state file. This file should contain the accumulator state at the
-    /// specified height.
+    /// Legacy accumulator-only import (unsupported without a matching leaf index).
     #[clap(long, requires("start_height"))]
     pub initial_state_path: Option<String>,
-    /// Creates a snapshot of the accumulator every n blocks
-    ///
-    /// The file will be named <height>.acc
+    /// Checkpoint interval (default: 1000). Keeps two checkpoints plus recovery deltas.
     #[clap(long)]
     pub acc_snapshot_every_n_blocks: Option<u32>,
 

@@ -12,7 +12,7 @@ use bitcoin::VarInt;
 use serde::Deserialize;
 use serde::Serialize;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LeafContext {
     #[allow(dead_code)]
     pub block_hash: BlockHash,
@@ -23,6 +23,40 @@ pub struct LeafContext {
     pub block_height: u32,
     pub median_time_past: u32,
     pub is_coinbase: bool,
+}
+
+impl Encodable for LeafContext {
+    fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<usize, bitcoin::io::Error> {
+        let mut size = self.block_hash.consensus_encode(writer)?;
+        size += self.txid.consensus_encode(writer)?;
+        size += self.vout.consensus_encode(writer)?;
+        size += self.value.consensus_encode(writer)?;
+        size += self.pk_script.consensus_encode(writer)?;
+        size += self.block_height.consensus_encode(writer)?;
+        size += self.median_time_past.consensus_encode(writer)?;
+        size += self.is_coinbase.consensus_encode(writer)?;
+        Ok(size)
+    }
+}
+
+impl Decodable for LeafContext {
+    fn consensus_decode<R: bitcoin::io::Read + ?Sized>(
+        reader: &mut R,
+    ) -> Result<Self, consensus::encode::Error> {
+        Ok(Self {
+            block_hash: Decodable::consensus_decode(reader)?,
+            txid: Decodable::consensus_decode(reader)?,
+            vout: Decodable::consensus_decode(reader)?,
+            value: Decodable::consensus_decode(reader)?,
+            pk_script: Decodable::consensus_decode(reader)?,
+            block_height: Decodable::consensus_decode(reader)?,
+            median_time_past: Decodable::consensus_decode(reader)?,
+            is_coinbase: Decodable::consensus_decode(reader)?,
+        })
+    }
 }
 
 /// Commitment of the leaf data, but in a compact way

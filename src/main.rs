@@ -38,9 +38,13 @@ mod shinigami_block_storage;
 mod block_index;
 mod chaininterface;
 mod chainview;
+mod checkpoint;
 mod cli;
 mod leaf_cache;
 mod udata;
+
+#[cfg(test)]
+mod test_support;
 
 use std::env;
 
