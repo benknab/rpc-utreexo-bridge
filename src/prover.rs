@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::{mpsc::Sender, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "api")]
+use crate::state::State;
 use anyhow::{ensure, Context, Result};
 #[cfg(feature = "api")]
 use bitcoin::consensus::serialize;
@@ -17,9 +19,9 @@ use bitcoin::{Transaction, TxOut, Txid};
 #[cfg(feature = "api")]
 use futures::channel::mpsc::Receiver;
 use log::{error, info};
-use rustreexo::accumulator::{mem_forest::MemForest, proof::Proof};
 #[cfg(feature = "api")]
-use rustreexo::accumulator::{node_hash::BitcoinNodeHash, stump::Stump};
+use rustreexo::accumulator::node_hash::BitcoinNodeHash;
+use rustreexo::accumulator::{mem_forest::MemForest, proof::Proof};
 #[cfg(feature = "api")]
 use serde::{Deserialize, Serialize};
 
@@ -158,14 +160,22 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
         match request {
             Requests::GetProof(hash) => Ok(Responses::Proof(
                 self.acc.prove(&[hash]).map_err(anyhow::Error::msg)?,
+                State::from_forest(self.tip, &self.acc),
             )),
             Requests::GetRoots => Ok(Responses::Roots(
                 self.acc.get_roots().iter().map(|r| r.get_data()).collect(),
             )),
-            Requests::GetCSN => Ok(Responses::Csn(Stump {
-                leaves: self.acc.leaves,
-                roots: self.acc.get_roots().iter().map(|r| r.get_data()).collect(),
-            })),
+            Requests::GetCSN => Ok(Responses::Csn(State::from_forest(self.tip, &self.acc))),
+            Requests::GetWitness(outpoint) => {
+                let leaf = self.lookup_leaf(&outpoint)?;
+                let hash = LeafData::get_leaf_hashes(&leaf);
+                let proof = self.acc.prove(&[hash]).map_err(anyhow::Error::msg)?;
+                Ok(Responses::Witness(
+                    leaf,
+                    proof,
+                    State::from_forest(self.tip, &self.acc),
+                ))
+            }
             Requests::GetLeaf(outpoint) => Ok(Responses::LeafData(self.lookup_leaf(&outpoint)?)),
             Requests::GetBlockByHeight(height) => Ok(Responses::Block(self.block_at(height)?)),
             Requests::GetBlocksByHeight(height, count) => {
@@ -186,6 +196,9 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                 let mut hashes = Vec::new();
                 let mut outputs = Vec::new();
                 for (vout, output) in tx.output.iter().enumerate() {
+                    if Self::is_unspendable(&output.script_pubkey) {
+                        continue;
+                    }
                     let outpoint = OutPoint {
                         txid,
                         vout: vout as u32,
@@ -202,9 +215,16 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                 }
                 let proof = self.acc.prove(&hashes).map_err(anyhow::Error::msg)?;
                 if only_unspent {
-                    Ok(Responses::TransactionOut(outputs, proof))
+                    Ok(Responses::TransactionOut(
+                        outputs,
+                        proof,
+                        State::from_forest(self.tip, &self.acc),
+                    ))
                 } else {
-                    Ok(Responses::Transaction((tx, proof)))
+                    Ok(Responses::Transaction(
+                        (tx, proof),
+                        State::from_forest(self.tip, &self.acc),
+                    ))
                 }
             }
         }
@@ -503,19 +523,21 @@ pub enum Requests {
     GetBlocksByHeight(u32, u32),
     GetTxUnpent(Txid),
     GetLeaf(OutPoint),
+    GetWitness(OutPoint),
 }
 
 #[cfg(feature = "api")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Responses {
-    Proof(Proof),
+    Proof(Proof, State),
     Roots(Vec<BitcoinNodeHash>),
     Block(Vec<u8>),
-    Transaction((Transaction, Proof)),
-    Csn(Stump),
+    Transaction((Transaction, Proof), State),
+    Csn(State),
     Blocks(Vec<Vec<u8>>),
-    TransactionOut(Vec<TxOut>, Proof),
+    TransactionOut(Vec<TxOut>, Proof, State),
     LeafData(LeafContext),
+    Witness(LeafContext, Proof, State),
 }
 
 #[cfg(test)]

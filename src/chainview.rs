@@ -236,6 +236,17 @@ impl ChainView {
         Ok(self.data.get(&key(b'a', hash.as_byte_array()))?)
     }
 
+    /// Caller holds `gate` while combining this with other chain metadata.
+    #[cfg(not(feature = "shinigami"))]
+    pub fn state(&self, hash: BlockHash) -> Result<Option<crate::state::State>> {
+        let Some(tip) = self.active_tip_for(hash)? else {
+            return Ok(None);
+        };
+        self.get_acc(hash)?
+            .map(|bytes| crate::state::State::decode(tip, &bytes))
+            .transpose()
+    }
+
     pub fn flush(&self) -> Result<()> {
         self.data.flush()?;
         Ok(())

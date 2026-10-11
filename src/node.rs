@@ -1546,7 +1546,8 @@ impl Peer {
         match request {
             V2Message::Bitcoin(request) => self.handle_bitcoin_message(request),
             V2Message::GetUtreexoProof(request) => self.handle_get_utreexo_proof(request),
-            V2Message::UtreexoProof(_) => Ok(()),
+            V2Message::GetUtreexoRoot(hash) => self.handle_get_utreexo_root(hash),
+            V2Message::UtreexoProof(_) | V2Message::UtreexoRoot(_) => Ok(()),
             V2Message::Ignored => Ok(()),
         }
     }
@@ -1642,10 +1643,28 @@ impl Peer {
         {
             return Err(PeerError::ProofBitmapTooLarge);
         }
-        let Some(tip) = self.context.chainview.active_tip_for(request.block_hash)? else {
-            return Ok(());
-        };
         let proof = {
+            let _guard = self
+                .context
+                .chainview
+                .gate
+                .read()
+                .map_err(|_| PeerError::PoisonedProofBackend)?;
+            let Some(tip) = self.context.chainview.active_tip_for(request.block_hash)? else {
+                return Ok(());
+            };
+            let Some(parent) = tip
+                .height
+                .checked_sub(1)
+                .map(|h| self.context.chainview.get_block_hash(h))
+                .transpose()?
+                .flatten()
+            else {
+                return Ok(());
+            };
+            let Some(state) = self.context.chainview.state(parent)? else {
+                return Ok(());
+            };
             let backend = self
                 .context
                 .proof_backend
@@ -1661,7 +1680,12 @@ impl Peer {
                 } else {
                     Self::select_bitmap(&udata.proof.hashes, &request.proof_bitmap)
                 },
-                target_locations: udata.proof.targets,
+                target_locations: udata
+                    .proof
+                    .targets
+                    .into_iter()
+                    .map(|t| crate::state::target_to_wire(t.0, state.leaves).map(VarInt))
+                    .collect::<anyhow::Result<_>>()?,
                 leaf_data: if request.include_all {
                     udata.leaves
                 } else {
@@ -1671,6 +1695,33 @@ impl Peer {
         };
         let payload = V2Codec::encode(&V2Message::UtreexoProof(proof))?;
         self.send_payload(&payload)
+    }
+
+    fn handle_get_utreexo_root(&mut self, hash: BlockHash) -> Result<(), PeerError> {
+        let root = {
+            let _guard = self
+                .context
+                .chainview
+                .gate
+                .read()
+                .map_err(|_| PeerError::PoisonedProofBackend)?;
+            let Some(state) = self.context.chainview.state(hash)? else {
+                return Ok(());
+            };
+            let roots = state
+                .roots
+                .iter()
+                .map(|h| Ok(BlockHash::from_slice(&hex::decode(h)?)?))
+                .collect::<anyhow::Result<_>>()?;
+            UtreexoRoot {
+                leaves: state.leaves,
+                target: 0,
+                block_hash: hash,
+                roots,
+                proof: Vec::new(),
+            }
+        };
+        self.send_payload(&V2Codec::encode(&V2Message::UtreexoRoot(root))?)
     }
 
     fn select_bitmap<T: Clone>(values: &[T], bitmap: &[u8]) -> Vec<T> {
@@ -1879,6 +1930,44 @@ impl Decodable for UtreexoProof {
     }
 }
 
+/// BIP183 historical roots. No optional accumulator-of-roots proof is supplied.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UtreexoRoot {
+    leaves: u64,
+    target: u64,
+    block_hash: BlockHash,
+    roots: Vec<BlockHash>,
+    proof: Vec<BlockHash>,
+}
+
+impl Encodable for UtreexoRoot {
+    fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
+        &self,
+        w: &mut W,
+    ) -> Result<usize, bitcoin::io::Error> {
+        Ok(VarInt(self.leaves).consensus_encode(w)?
+            + VarInt(self.target).consensus_encode(w)?
+            + self.block_hash.consensus_encode(w)?
+            + self.roots.consensus_encode(w)?
+            + self.proof.consensus_encode(w)?)
+    }
+}
+
+#[cfg(test)]
+impl Decodable for UtreexoRoot {
+    fn consensus_decode<R: bitcoin::io::Read + ?Sized>(
+        r: &mut R,
+    ) -> Result<Self, bitcoin::consensus::encode::Error> {
+        Ok(Self {
+            leaves: VarInt::consensus_decode(r)?.0,
+            target: VarInt::consensus_decode(r)?.0,
+            block_hash: Decodable::consensus_decode(r)?,
+            roots: Decodable::consensus_decode(r)?,
+            proof: Decodable::consensus_decode(r)?,
+        })
+    }
+}
+
 /// Internal message set crossing the encrypted transport boundary.
 ///
 /// [`V2Message::Ignored`] represents an authenticated but unsupported inbound
@@ -1888,6 +1977,8 @@ enum V2Message {
     Bitcoin(NetworkMessage),
     UtreexoProof(UtreexoProof),
     GetUtreexoProof(GetUtreexoProof),
+    UtreexoRoot(UtreexoRoot),
+    GetUtreexoRoot(BlockHash),
     Ignored,
 }
 
@@ -1909,6 +2000,16 @@ impl V2Codec {
             V2Message::GetUtreexoProof(request) => {
                 let mut buffer = vec![30];
                 request.consensus_encode(&mut buffer)?;
+                Ok(buffer)
+            }
+            V2Message::UtreexoRoot(root) => {
+                let mut buffer = vec![35];
+                root.consensus_encode(&mut buffer)?;
+                Ok(buffer)
+            }
+            V2Message::GetUtreexoRoot(hash) => {
+                let mut buffer = vec![36];
+                hash.consensus_encode(&mut buffer)?;
                 Ok(buffer)
             }
             V2Message::Ignored => Err(PeerError::CannotEncodeIgnoredMessage),
@@ -1991,6 +2092,7 @@ impl V2Codec {
                 Self::decode_exact(payload)?,
             ))),
             30 => Ok(V2Message::GetUtreexoProof(Self::decode_exact(payload)?)),
+            36 => Ok(V2Message::GetUtreexoRoot(Self::decode_exact(payload)?)),
             _ => Ok(V2Message::Ignored),
         }
     }
@@ -2003,6 +2105,7 @@ impl V2Codec {
         let command = CommandString::consensus_decode(&mut command_reader)?;
         let payload = &buffer[12..];
         match command.as_ref() {
+            "geturoot" => Ok(V2Message::GetUtreexoRoot(Self::decode_exact(payload)?)),
             "version" => {
                 let version: VersionMessage = Self::decode_exact(payload)?;
                 if version.user_agent.len() > MAX_USER_AGENT_BYTES {
@@ -2220,6 +2323,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn root_messages_match_utreexod_wire_vectors() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/data/utreexo.json")).unwrap();
+        for step in vectors["steps"].as_array().unwrap() {
+            let root = UtreexoRoot {
+                leaves: step["Leaves"].as_u64().unwrap(),
+                target: 0,
+                block_hash: BlockHash::all_zeros(),
+                proof: vec![],
+                roots: step["Roots"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|h| {
+                        BlockHash::from_slice(&hex::decode(h.as_str().unwrap()).unwrap()).unwrap()
+                    })
+                    .collect(),
+            };
+            let payload = V2Codec::encode(&V2Message::UtreexoRoot(root)).unwrap();
+            assert_eq!(payload[0], 35);
+            assert_eq!(
+                hex::encode(&payload[1..]),
+                step["RootMessage"].as_str().unwrap()
+            );
+        }
+        let request = V2Message::GetUtreexoRoot(BlockHash::all_zeros());
+        assert_eq!(
+            V2Codec::decode(&V2Codec::encode(&request).unwrap()).unwrap(),
+            request
+        );
+        assert!(V2Codec::decode(&[36; 32]).is_err());
+        assert!(V2Codec::decode(&[36; 34]).is_err());
+    }
+
+    #[test]
     fn p2pv2_codec_handles_supported_inbound_and_outbound_bip183_messages() {
         let block_hash = BlockHash::all_zeros();
         let inbound_messages = [
@@ -2405,7 +2543,7 @@ mod tests {
             let mut stream = TcpStream::from_std(stream);
             let mut peer = Peer::new(context)?;
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !peer.is_established() {
+            while !peer.is_established() || peer.wants_write() {
                 peer.on_writable(&mut stream)?;
                 peer.on_readable(&mut stream)?;
                 if Instant::now() >= deadline {
@@ -2451,8 +2589,15 @@ mod tests {
         let gate = Arc::new(crate::test_support::FetchGate::default());
         let mut backend = crate::test_support::TestChain::new();
         backend.1 = Some(gate.clone());
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        let first = crate::test_support::block(&genesis, 1, vec![]);
+        let block = crate::test_support::block(&first, 2, vec![]);
+        backend
+            .0
+            .write()
+            .unwrap()
+            .extend([first.clone(), block.clone()]);
         context.block_backend = Arc::new(backend);
-        let block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
         let block_hash = block.block_hash();
         let proof_hash = BlockHash::from_byte_array([1; 32]);
         let leaf = CompactLeafData {
@@ -2460,11 +2605,32 @@ mod tests {
             amount: 5_000,
             spk_ty: ScriptPubkeyType::PubKeyHash,
         };
-        context.chainview.initialize(block.header).unwrap();
+        context.chainview.initialize(genesis.header).unwrap();
+        let mut roots = 8u64.to_le_bytes().to_vec();
+        roots.extend([1; 32]);
+        for (index, b) in [&first, &block].into_iter().enumerate() {
+            context
+                .chainview
+                .commit(
+                    &crate::chainview::Delta {
+                        tip: crate::chainview::Tip {
+                            height: index as u32 + 1,
+                            block_hash: b.block_hash(),
+                        },
+                        parent: b.header.prev_blockhash,
+                        adds: vec![],
+                        dels: vec![],
+                        changes: vec![],
+                    },
+                    &b.header,
+                    &roots,
+                )
+                .unwrap();
+        }
         let udata = UData {
             remember_idx: Vec::new(),
             proof: BatchProof {
-                targets: vec![VarInt(7)],
+                targets: vec![VarInt(10)],
                 hashes: vec![proof_hash],
             },
             leaves: vec![leaf.clone()],
@@ -2473,15 +2639,16 @@ mod tests {
             .proof_backend
             .write()
             .expect("lock test block file")
-            .put(0, block_hash, &udata)
+            .put(2, block_hash, &udata)
             .unwrap();
         let expected_proof = UtreexoProof {
             block_hash,
             proof_hashes: vec![proof_hash],
-            target_locations: vec![VarInt(7)],
+            target_locations: vec![VarInt((1u64 << 63) + 2)],
             leaf_data: vec![leaf],
         };
 
+        let proof_store = context.proof_backend.clone();
         let registry = Arc::new(Mutex::new(PeerRegistry::new(16)));
         let (sender, receiver) = std::sync::mpsc::channel();
         let worker =
@@ -2613,6 +2780,27 @@ mod tests {
             expected_proof
         );
 
+        crate::prover::BlockStorage::prune(&mut *proof_store.write().unwrap(), 1000).unwrap();
+        protocol
+            .write(&Payload::genuine(
+                V2Codec::encode(&V2Message::GetUtreexoRoot(first.block_hash())).unwrap(),
+            ))
+            .unwrap();
+        let response = protocol
+            .read()
+            .expect("historical roots after proof pruning");
+        let (id, payload) = response.contents().split_first().unwrap();
+        assert_eq!(*id, 35);
+        assert_eq!(
+            deserialize::<UtreexoRoot>(payload).unwrap(),
+            UtreexoRoot {
+                leaves: 8,
+                target: 0,
+                block_hash: first.block_hash(),
+                roots: vec![proof_hash],
+                proof: vec![],
+            }
+        );
         gate.state.lock().unwrap().1 = true;
         gate.changed.notify_all();
         let response = protocol.read().expect("receive Core-backed block");
