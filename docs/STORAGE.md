@@ -2,6 +2,8 @@
 
 ## Block archive and proof retention
 
+This describes Bitcoin mode. Shinigami mode writes its separate JSON proof/state exports.
+
 Bitcoin Core (or the configured `Blockchain` backend) owns the Bitcoin block
 archive. The bridge stores no block bodies. `proofs/` holds one atomic proof-only
 record per retained height; REST combines those proofs with backend block data
@@ -18,7 +20,8 @@ The bridge advertises `NODE_UTREEXO`, witness, and P2PV2. It adds
 `NODE_NETWORK_LIMITED` when it has proofs for the latest 288 processed blocks
 (or every block of a shorter chain). It does not advertise historical proof/archive
 service. Windows below 288 and gaps caused by `--save-proofs-after` can prevent
-limited-service advertisement.
+limited-service advertisement. A rollback can also leave a temporary gap at the
+old end of the window until processing fills a complete recent window again.
 
 The backend must retain the blocks clients request. An archival Core backend is
 recommended. Sync and outpoint membership do not require `txindex`; legacy
@@ -52,3 +55,31 @@ state. Accumulator-only `--initial-state-path`/`--start-height` imports are reje
 for the same reason. The bridge never deletes a legacy directory for you.
 
 The backend network must match `--network` and the stored genesis hash.
+
+## Verification and small-fixture measurement
+
+Run the supported Rust checks with `just ci`. For isolated real-node checks:
+
+```sh
+cargo build --locked
+python3 contrib/regtest.py --utreexod /path/to/utreexod
+```
+
+The harness creates temporary regtest nodes and a temporary wallet. It checks
+leaf, root, proof, and target parity against Utreexod; membership at an earlier
+block after spending; disk pruning; restart after SIGKILL; and an equal-height
+reorganization. Core runs with `txindex=0`. The reference flat proof index at
+Utreexod `e99c32c` panics on `invalidateblock`, so the harness compares the bridge's
+post-reorg state against a clean Utreexod replay of the replacement chain.
+
+Pass `--consumer-project /path/to/limited-zk-bip-322` to run that client's real
+REST membership and BIP324/BIP183 root checks before and after the spend. Its
+fresh post-spend processes receive only lookup identifiers and node addresses.
+This checks the node integration, not mainnet application ZK receipt acceptance.
+
+A 127-block run using Core 30.2 and an unoptimized bridge took 2.168 seconds to
+process its initial 102 mostly empty blocks. With retention set to 8, the final
+proof files used 320 bytes; all eight retained blocks had no spent inputs. Total
+bridge file sizes were 1,069,837 bytes, including checkpoints, journal, leaf index,
+headers, roots, and the log. There was no bridge block archive. This small fixture
+does not estimate mainnet disk use, peak memory, or initial-sync throughput.

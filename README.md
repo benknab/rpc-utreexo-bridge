@@ -52,7 +52,7 @@ Assuming you have a Bitcoin node running, just start the bridge as follows:
 ./target/release/bridge
 ```
 
-The bridge listens on port 8333 for BIP324 P2PV2 connections and serves Utreexo inclusion proofs with the BIP183 `getuproof`/`uproof` messages. The REST API defaults to `127.0.0.1:3000` (`API_HOST`). Recent block proofs are retained for 288 blocks by default (`--proof-retention`); historical accumulator roots remain available. See [the API docs](docs/API.md) and [storage/upgrade instructions](docs/STORAGE.md).
+The bridge listens on port 8333 for BIP324 P2PV2 connections and serves Utreexo inclusion proofs with the BIP183 `getuproof`/`uproof` messages. The REST API defaults to `127.0.0.1:3000` (`API_HOST`). Recent block proofs are retained for 288 blocks by default (`--proof-retention`); historical accumulator roots remain available. See [the API docs](docs/api.md) and [storage/upgrade instructions](docs/STORAGE.md).
 
 Inbound peers are capped at 64 connections. Handshakes expire after 10 seconds and are limited to 1 MiB/64 packets; established peers are disconnected for packets over 256 KiB, oversized request batches, or sustained rates above 100 packets per second.
 Every minute, the node logs the connected-peer total and groups identified peers by their sanitized, self-reported software name, for example `Floresta=10 Satoshi=10`.

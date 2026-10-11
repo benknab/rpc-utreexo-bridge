@@ -78,9 +78,7 @@ pub fn run_bridge() -> anyhow::Result<()> {
         "backend network differs from --network"
     );
 
-    // Create a prover, this module will download blocks from the bitcoin core
-    // node and save them to disk. It will also create proofs for the blocks
-    // and save them to disk.
+    // Process backend blocks and retain only derived state and recent proofs.
     let leaf_data = DiskLeafStorage::new(view.clone());
 
     // a signal used to stop the prover
@@ -125,7 +123,7 @@ pub fn run_bridge() -> anyhow::Result<()> {
     node::Node::run(p2p_address, worker_context, block_notifier_rx)?;
 
     let (sender, receiver) = channel(1024);
-    // This is our implementation of the json-rpc api, it will listen for
+    // This is our implementation of the REST API, it will listen for
     // incoming connections and serve some Utreexo data to clients.
     info!("Starting api");
     let host = env::var("API_HOST").unwrap_or_else(|_| "127.0.0.1:3000".into());

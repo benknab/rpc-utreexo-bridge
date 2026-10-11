@@ -1593,7 +1593,25 @@ impl Peer {
                 self.send_message(NetworkMessage::Verack)?;
             }
             NetworkMessage::GetCFilters(request) if request.filter_type == FILTER_TYPE_UTREEXO => {
-                if let Some(accumulator) = self.context.chainview.get_acc(request.stop_hash)? {
+                let accumulator = {
+                    let _guard = self
+                        .context
+                        .chainview
+                        .gate
+                        .read()
+                        .map_err(|_| PeerError::PoisonedProofBackend)?;
+                    if self
+                        .context
+                        .chainview
+                        .active_tip_for(request.stop_hash)?
+                        .is_some()
+                    {
+                        self.context.chainview.get_acc(request.stop_hash)?
+                    } else {
+                        None
+                    }
+                };
+                if let Some(accumulator) = accumulator {
                     self.send_message(NetworkMessage::CFilter(CFilter {
                         filter_type: FILTER_TYPE_UTREEXO,
                         block_hash: request.stop_hash,

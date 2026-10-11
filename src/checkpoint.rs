@@ -23,6 +23,15 @@ pub struct Checkpoints {
 impl Checkpoints {
     pub fn new(directory: PathBuf) -> Result<Self> {
         fs::create_dir_all(&directory)?;
+        // A crash can leave an unpublished full-size snapshot. Reclaim it on
+        // startup rather than retaining one large temporary file per crash.
+        for entry in fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "tmp") {
+                fs::remove_file(path)?;
+            }
+        }
+        File::open(&directory)?.sync_all()?;
         Ok(Self { directory })
     }
 

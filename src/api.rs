@@ -19,7 +19,6 @@ use bitcoin::BlockHash;
 use bitcoin::OutPoint;
 use bitcoin::TxOut;
 use bitcoin::Txid;
-use bitcoin_hashes::hex::ToHex;
 use bitcoincore_rpc::jsonrpc::serde_json::json;
 use futures::channel::mpsc::Sender;
 use futures::lock::Mutex;
@@ -109,7 +108,7 @@ async fn get_leaf_data(outpoint: web::Path<String>, data: web::Data<AppState>) -
     let res = perform_request(&data, Requests::GetLeaf(outpoint.unwrap())).await;
     match res {
         Ok(Responses::LeafData(leaf_data)) => {
-            let leaf_hash = LeafData::get_leaf_hashes(&leaf_data).to_hex();
+            let leaf_hash = hash_hex(LeafData::get_leaf_hashes(&leaf_data));
             let leaf_data = LeafDataResponse {
                 hash: leaf_hash.clone(),
                 block_hash: leaf_data.block_hash,
@@ -403,7 +402,17 @@ async fn get_witness(outpoint: web::Path<OutPoint>, data: web::Data<AppState>) -
             actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
             "unexpected prover response",
         ),
-        Err(e) => failure(actix_web::http::StatusCode::NOT_FOUND, e),
+        Err(e) => {
+            let status = match e.as_str() {
+                "outpoint is not unspent at processed tip" => {
+                    actix_web::http::StatusCode::NOT_FOUND
+                }
+                "prover unavailable" => actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+                "prover request timed out" => actix_web::http::StatusCode::GATEWAY_TIMEOUT,
+                _ => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            failure(status, e)
+        }
     }
 }
 

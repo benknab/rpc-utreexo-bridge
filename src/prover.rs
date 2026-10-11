@@ -231,12 +231,9 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
     }
 
     fn lookup_leaf(&self, outpoint: &OutPoint) -> Result<LeafContext> {
-        self.leaf_data.get(outpoint)?.with_context(|| {
-            format!(
-                "outpoint {outpoint} is not unspent at {}",
-                self.tip.block_hash
-            )
-        })
+        self.leaf_data
+            .get(outpoint)?
+            .context("outpoint is not unspent at processed tip")
     }
 
     #[cfg(feature = "api")]
@@ -618,8 +615,11 @@ mod tests {
         p.connect_block(&third, 0).unwrap(); // journal only
         let expected = acc_bytes(&p.acc);
         p.view.flush().unwrap();
+        let partial = dir.join("checkpoints/0000000003-interrupted.tmp");
+        std::fs::write(&partial, b"incomplete snapshot").unwrap();
         drop(p); // no shutdown snapshot
         let mut p = prover(&dir, &chain);
+        assert!(!partial.exists());
         assert_eq!(p.tip.block_hash, third.block_hash());
         assert_eq!(acc_bytes(&p.acc), expected);
         assert_eq!(
