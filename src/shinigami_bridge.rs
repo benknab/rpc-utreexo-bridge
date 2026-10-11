@@ -10,7 +10,6 @@ use clap::Parser;
 use log::info;
 use log::warn;
 
-use crate::block_index::BlocksIndex;
 use crate::chainview;
 use crate::cli::CliArgs;
 use crate::get_chain_provider;
@@ -51,23 +50,6 @@ pub fn run_bridge() -> anyhow::Result<()> {
     let view = chainview::ChainView::new(store);
     let view = Arc::new(view);
 
-    // This database stores some useful information about the blocks, but not
-    // the blocks themselves
-    let index_store = BlocksIndex {
-        database: kv::Store::new(kv::Config {
-            path: subdir("index/").into(),
-            temporary: false,
-            use_compression: false,
-            flush_every_ms: Some(1000),
-            cache_capacity: Some(1_000_000),
-            segment_size: None,
-        })
-        .unwrap(),
-    };
-
-    // Put it into an Arc so we can share it between threads
-    let index_store = Arc::new(index_store);
-
     // This database stores the blocks themselves, it's a collection of flat files
     // that are indexed by the index above. They are stored in the `blocks/` directory
     // and are serialized as bitcoin blocks, so we don't need to do any parsing
@@ -101,7 +83,6 @@ pub fn run_bridge() -> anyhow::Result<()> {
     let (sender, recv) = channel();
     let mut prover = prover::Prover::new(
         client,
-        index_store,
         blocks,
         view,
         leaf_data,

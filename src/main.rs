@@ -22,7 +22,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 mod api;
 
 #[cfg(not(feature = "shinigami"))]
-mod blockfile;
+mod proofstore;
 
 #[cfg(feature = "esplora")]
 mod esplora;
@@ -35,7 +35,6 @@ mod prover;
 #[cfg(feature = "shinigami")]
 mod shinigami_block_storage;
 
-mod block_index;
 mod chaininterface;
 mod chainview;
 mod checkpoint;

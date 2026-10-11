@@ -105,6 +105,22 @@ pub enum ScriptPubkeyType {
     WitnessV0ScriptHash,
 }
 
+impl ScriptPubkeyType {
+    pub fn from_script(script: &bitcoin::Script) -> Self {
+        if script.is_p2pkh() {
+            Self::PubKeyHash
+        } else if script.is_p2sh() {
+            Self::ScriptHash
+        } else if script.is_p2wpkh() {
+            Self::WitnessV0PubKeyHash
+        } else if script.is_p2wsh() {
+            Self::WitnessV0ScriptHash
+        } else {
+            Self::Other(script.to_bytes().into_boxed_slice())
+        }
+    }
+}
+
 impl Decodable for ScriptPubkeyType {
     fn consensus_decode<R: bitcoin::io::Read + ?Sized>(
         reader: &mut R,
@@ -189,6 +205,58 @@ pub struct UData {
     pub proof: BatchProof,
     /// LeafData are the tx validation data for every input.
     pub leaves: Vec<CompactLeafData>,
+}
+
+impl Encodable for UData {
+    fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<usize, bitcoin::io::Error> {
+        let mut size = VarInt(self.remember_idx.len() as u64).consensus_encode(writer)?;
+        for index in &self.remember_idx {
+            size += VarInt(*index).consensus_encode(writer)?;
+        }
+        size += self.proof.targets.consensus_encode(writer)?;
+        size += self.proof.hashes.consensus_encode(writer)?;
+        size += VarInt(self.leaves.len() as u64).consensus_encode(writer)?;
+        for leaf in &self.leaves {
+            size += leaf.header_code.consensus_encode(writer)?;
+            size += leaf.amount.consensus_encode(writer)?;
+            size += leaf.spk_ty.consensus_encode(writer)?;
+        }
+        Ok(size)
+    }
+}
+
+impl Decodable for UData {
+    fn consensus_decode<R: bitcoin::io::Read + ?Sized>(
+        reader: &mut R,
+    ) -> Result<Self, consensus::encode::Error> {
+        let remember: Vec<VarInt> = Decodable::consensus_decode(reader)?;
+        let proof = BatchProof {
+            targets: Decodable::consensus_decode(reader)?,
+            hashes: Decodable::consensus_decode(reader)?,
+        };
+        let count = VarInt::consensus_decode(reader)?.0;
+        if count > 100_000 {
+            return Err(consensus::encode::Error::ParseFailed(
+                "too many proof leaves",
+            ));
+        }
+        let mut leaves = Vec::new();
+        for _ in 0..count {
+            leaves.push(CompactLeafData {
+                header_code: Decodable::consensus_decode(reader)?,
+                amount: Decodable::consensus_decode(reader)?,
+                spk_ty: Decodable::consensus_decode(reader)?,
+            });
+        }
+        Ok(Self {
+            remember_idx: remember.into_iter().map(|v| v.0).collect(),
+            proof,
+            leaves,
+        })
+    }
 }
 
 /// A block plus some udata

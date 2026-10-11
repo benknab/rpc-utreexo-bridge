@@ -1,6 +1,6 @@
 //! Synthetic trusted-chain fixtures for persistence and fork tests.
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use anyhow::{Context, Result};
 use bitcoin::{
@@ -44,16 +44,36 @@ pub fn store(path: &Path) -> kv::Store {
 }
 
 #[derive(Clone)]
-pub struct TestChain(pub Arc<RwLock<Vec<Block>>>);
+pub struct TestChain(pub Arc<RwLock<Vec<Block>>>, pub Option<Arc<FetchGate>>);
+
+#[derive(Default)]
+pub struct FetchGate {
+    pub state: Mutex<(bool, bool)>, // entered, released
+    pub changed: Condvar,
+}
 impl TestChain {
     pub fn new() -> Self {
-        Self(Arc::new(RwLock::new(vec![
-            bitcoin::constants::genesis_block(Network::Regtest),
-        ])))
+        Self(
+            Arc::new(RwLock::new(vec![bitcoin::constants::genesis_block(
+                Network::Regtest,
+            )])),
+            None,
+        )
     }
 }
 impl Blockchain for TestChain {
     fn get_block(&self, hash: BlockHash) -> Result<Block> {
+        if let Some(gate) = &self.1 {
+            let mut state = gate.state.lock().unwrap();
+            state.0 = true;
+            gate.changed.notify_all();
+            // A timeout keeps a failing test from leaking a blocked thread.
+            let (state, _) = gate
+                .changed
+                .wait_timeout_while(state, std::time::Duration::from_secs(10), |s| !s.1)
+                .unwrap();
+            anyhow::ensure!(state.1, "test fetch was not released");
+        }
         self.0
             .read()
             .unwrap()

@@ -19,11 +19,13 @@ pub struct CliArgs {
     #[clap(long, short = 'g', default_value_t = 10_000)]
     pub block_files_granularity: u32,
 
-    /// If you don't want to save proofs for very old blocks, you can set this options with
-    /// the number of blocks you want to keep, and we'll only keep proofs for blocks that are
-    /// newer than that.
+    /// Save proofs only above this absolute height (also subject to --proof-retention).
     #[clap(long)]
     pub save_proofs_after: Option<u32>,
+
+    /// Number of recent block proofs to retain (historical roots are always retained).
+    #[clap(long, default_value_t = 288)]
+    pub proof_retention: u32,
 
     /// The network we are operating on
     #[clap(long, short = 'n', default_value = "bitcoin")]

@@ -16,7 +16,7 @@ It contains multiple components:
 - Rust 1.85.0 or later
 - Linux or MacOS
 - Because just keep things on RAM, you'll need a machine with at least 16GB of RAM.
-- At least 500GB of free disk space, 1TB recommended.
+- Disk for the accumulator, leaf index, historical roots, checkpoints, and a configurable window of block proofs. Bitcoin Core retains the only block archive; see [storage and recovery](docs/STORAGE.md).
 - A trusted source of blocks to connect to. You can use Bitcoin Core.
 
 ### From source
@@ -52,7 +52,7 @@ Assuming you have a Bitcoin node running, just start the bridge as follows:
 ./target/release/bridge
 ```
 
-The bridge listens on port 8333 for BIP324 P2PV2 connections and serves Utreexo inclusion proofs with the BIP183 `getuproof`/`uproof` messages. It also starts a websocket server on port 8334. API runs on port 8335. See [the API docs](docs/API.md) for more information.
+The bridge listens on port 8333 for BIP324 P2PV2 connections and serves Utreexo inclusion proofs with the BIP183 `getuproof`/`uproof` messages. The REST API defaults to `127.0.0.1:3000` (`API_HOST`). Recent block proofs are retained for 288 blocks by default (`--proof-retention`); historical accumulator roots remain available. See [the API docs](docs/API.md) and [storage/upgrade instructions](docs/STORAGE.md).
 
 Inbound peers are capped at 64 connections. Handshakes expire after 10 seconds and are limited to 1 MiB/64 packets; established peers are disconnected for packets over 256 KiB, oversized request batches, or sustained rates above 100 packets per second.
 Every minute, the node logs the connected-peer total and groups identified peers by their sanitized, self-reported software name, for example `Floresta=10 Satoshi=10`.
@@ -90,9 +90,9 @@ There are a few environment variables that can be used to configure the bridge n
 - [x] P2P
 - [ ] Trusted utxo commitment for instant ibd
 - [ ] Lease the accumulated utxo set to other nodes (fast bridge bootstrapping)
-- [ ] Support for pruning
-- [ ] Support for pruning with checkpoints
-- [ ] Leaf caches should allow for disk persistence, so we can reduce memory usage without needing to ask for utxos again.
+- [x] Support for pruning block proofs
+- [x] Bounded checkpoint and journal recovery
+- [x] Persistent leaf index committed with processed chain state
 - [ ] Rustreexo should allow for in disk forest.
 - [ ] Support for socks5 proxy
 - [ ] Support for tor onion services

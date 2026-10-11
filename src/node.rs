@@ -91,9 +91,9 @@ use mio::Interest;
 use mio::Token;
 use self_cell::self_cell;
 
-use crate::block_index::BlocksIndex;
-use crate::blockfile::BlockFile;
+use crate::chaininterface::Blockchain;
 use crate::chainview::ChainView;
+use crate::proofstore::ProofStore;
 use crate::udata::CompactLeafData;
 
 /// Deprecated Utreexo compact-filter type retained for compatibility.
@@ -449,11 +449,11 @@ impl MessageRateLimiter {
 /// Data required by peers to answer requests.
 #[derive(Clone)]
 pub struct WorkerContext {
-    /// The blocks and proofs served to peers.
-    pub proof_backend: Arc<RwLock<BlockFile>>,
+    /// Locally retained block proofs, without block payloads.
+    pub proof_backend: Arc<RwLock<ProofStore>>,
 
-    /// The index used to locate blocks in the proof backend.
-    pub proof_index: Arc<BlocksIndex>,
+    /// Trusted archive used by bounded background fetchers.
+    pub block_backend: Arc<dyn Blockchain>,
 
     /// Cached active-chain metadata and headers.
     pub chainview: Arc<ChainView>,
@@ -584,6 +584,17 @@ struct Worker {
     peers: HashMap<Token, PeerConnection>,
     poller: mio::Poll,
     registry: SharedPeerRegistry,
+    block_requests: SyncSender<BlockRequest>,
+    block_results: Receiver<BlockResult>,
+}
+
+struct BlockRequest {
+    peer: usize,
+    hash: BlockHash,
+}
+struct BlockResult {
+    peer: usize,
+    message: NetworkMessage,
 }
 
 impl Worker {
@@ -593,6 +604,32 @@ impl Worker {
         messages: Receiver<WorkerMessage>,
         registry: SharedPeerRegistry,
     ) -> std::io::Result<Self> {
+        let (block_requests, requests) = std::sync::mpsc::sync_channel::<BlockRequest>(16);
+        let (results, block_results) = std::sync::mpsc::sync_channel(4);
+        let backend = context.block_backend.clone();
+        std::thread::Builder::new()
+            .name(format!("bridge-block-fetcher-{id}"))
+            .spawn(move || {
+                while let Ok(request) = requests.recv() {
+                    let message = match backend.get_block(request.hash) {
+                        Ok(block) if block.block_hash() == request.hash => {
+                            NetworkMessage::Block(block)
+                        }
+                        Ok(_) | Err(_) => {
+                            NetworkMessage::NotFound(vec![Inventory::WitnessBlock(request.hash)])
+                        }
+                    };
+                    if results
+                        .send(BlockResult {
+                            peer: request.peer,
+                            message,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })?;
         Ok(Self {
             context,
             events: Events::with_capacity(EVENT_CAPACITY),
@@ -602,6 +639,8 @@ impl Worker {
             peers: HashMap::new(),
             poller: mio::Poll::new()?,
             registry,
+            block_requests,
+            block_results,
         })
     }
 
@@ -611,6 +650,7 @@ impl Worker {
             if !self.handle_messages()? {
                 return Ok(());
             }
+            self.handle_block_results();
 
             match self.poller.poll(&mut self.events, Some(POLL_TIMEOUT)) {
                 Ok(()) => self.handle_events(),
@@ -618,6 +658,29 @@ impl Worker {
                 Err(error) => return Err(error.into()),
             }
             self.expire_handshakes();
+        }
+    }
+
+    fn handle_block_results(&mut self) {
+        for _ in 0..4 {
+            let Ok(result) = self.block_results.try_recv() else {
+                break;
+            };
+            let Some(token) = self
+                .peers
+                .iter()
+                .find_map(|(token, c)| (c.id == result.peer).then_some(*token))
+            else {
+                continue;
+            };
+            let connection = self.peers.get_mut(&token).expect("located peer");
+            connection.peer.block_pending = false;
+            if let Err(error) = Self::protect_peer(|| connection.peer.send_message(result.message))
+            {
+                self.remove_peer(token, &error);
+            } else if let Err(error) = self.refresh_interest(token) {
+                self.remove_peer(token, &error);
+            }
         }
     }
 
@@ -663,10 +726,13 @@ impl Worker {
             token,
             Interest::READABLE | Interest::WRITABLE,
         )?;
+        let mut peer = Peer::new(self.context.clone())?;
+        peer.block_requests = Some(self.block_requests.clone());
+        peer.id = id;
         let connection = PeerConnection {
             address,
             id,
-            peer: Peer::new(self.context.clone())?,
+            peer,
             stream,
         };
 
@@ -1040,6 +1106,9 @@ enum HandshakeState {
 /// so fragmented handshakes and encrypted packets can resume on the next
 /// readiness event.
 struct Peer {
+    id: usize,
+    block_requests: Option<SyncSender<BlockRequest>>,
+    block_pending: bool,
     connected_at: Instant,
     context: WorkerContext,
     handshake: Option<HandshakeState>,
@@ -1065,6 +1134,9 @@ impl Peer {
         let handshake: Handshake<SentKey<'static>> = handshake.send_key(None, &mut write_buffer)?;
         let now = Instant::now();
         Ok(Self {
+            id: 0,
+            block_requests: None,
+            block_pending: false,
             connected_at: now,
             context,
             handshake: Some(HandshakeState::AwaitingKey(handshake)),
@@ -1504,7 +1576,7 @@ impl Peer {
                 );
                 self.send_message(NetworkMessage::Version(VersionMessage {
                     version: 70016,
-                    services: Self::advertised_services(),
+                    services: self.services()?,
                     timestamp: version.timestamp.saturating_add(1),
                     receiver: version.sender.clone(),
                     sender: version.receiver,
@@ -1540,19 +1612,21 @@ impl Peer {
         let mut not_found = Vec::new();
         for item in inventory {
             if let Inventory::WitnessBlock(block_hash) = item {
-                let Some(index) = self.context.proof_index.get_index(block_hash) else {
+                let available = self.context.chainview.active_tip_for(block_hash)?.is_some();
+                if available
+                    && !self.block_pending
+                    && self.block_requests.as_ref().is_some_and(|sender| {
+                        sender
+                            .try_send(BlockRequest {
+                                peer: self.id,
+                                hash: block_hash,
+                            })
+                            .is_ok()
+                    })
+                {
+                    self.block_pending = true;
+                } else {
                     not_found.push(Inventory::WitnessBlock(block_hash));
-                    continue;
-                };
-                let block = self
-                    .context
-                    .proof_backend
-                    .read()
-                    .map_err(|_| PeerError::PoisonedProofBackend)?
-                    .get_block(index);
-                match block {
-                    Some(block) => self.send_message(NetworkMessage::Block(block.into()))?,
-                    None => not_found.push(Inventory::WitnessBlock(block_hash)),
                 }
             }
         }
@@ -1568,7 +1642,7 @@ impl Peer {
         {
             return Err(PeerError::ProofBitmapTooLarge);
         }
-        let Some(index) = self.context.proof_index.get_index(request.block_hash) else {
+        let Some(tip) = self.context.chainview.active_tip_for(request.block_hash)? else {
             return Ok(());
         };
         let proof = {
@@ -1577,10 +1651,7 @@ impl Peer {
                 .proof_backend
                 .read()
                 .map_err(|_| PeerError::PoisonedProofBackend)?;
-            let Some(block) = backend.get_block(index) else {
-                return Ok(());
-            };
-            let Some(udata) = block.udata else {
+            let Some(udata) = backend.get(tip.height, request.block_hash)? else {
                 return Ok(());
             };
             UtreexoProof {
@@ -1657,11 +1728,29 @@ impl Peer {
     }
 
     fn advertised_services() -> ServiceFlags {
-        ServiceFlags::NETWORK_LIMITED
-            | ServiceFlags::NETWORK
-            | ServiceFlags::WITNESS
-            | ServiceFlags::P2P_V2
-            | ServiceFlags::from(NODE_UTREEXO)
+        ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | ServiceFlags::from(NODE_UTREEXO)
+    }
+
+    fn services(&self) -> Result<ServiceFlags, PeerError> {
+        let mut services = Self::advertised_services();
+        let _guard = self
+            .context
+            .chainview
+            .gate
+            .read()
+            .map_err(|_| PeerError::PoisonedProofBackend)?;
+        if let Some(tip) = self.context.chainview.tip()? {
+            if self
+                .context
+                .proof_backend
+                .read()
+                .map_err(|_| PeerError::PoisonedProofBackend)?
+                .covers(tip.height, 288)
+            {
+                services |= ServiceFlags::NETWORK_LIMITED;
+            }
+        }
+        Ok(services)
     }
 }
 
@@ -2127,7 +2216,6 @@ mod tests {
     use crate::udata::BatchProof;
     use crate::udata::ScriptPubkeyType;
     use crate::udata::UData;
-    use crate::udata::UtreexoBlock;
 
     use super::*;
 
@@ -2289,11 +2377,9 @@ mod tests {
         };
         WorkerContext {
             proof_backend: Arc::new(RwLock::new(
-                BlockFile::new(root.join("blocks.dat"), 1024 * 1024).expect("open test block file"),
+                ProofStore::new(root.join("proofs"), 288).expect("open test proofs"),
             )),
-            proof_index: Arc::new(BlocksIndex {
-                database: store("index"),
-            }),
+            block_backend: Arc::new(crate::test_support::TestChain::new()),
             chainview: Arc::new(ChainView::new(store("chainview"))),
             magic: Magic::REGTEST,
         }
@@ -2361,7 +2447,11 @@ mod tests {
                 .expect("system clock after epoch")
                 .as_nanos()
         ));
-        let context = test_worker_context(&storage);
+        let mut context = test_worker_context(&storage);
+        let gate = Arc::new(crate::test_support::FetchGate::default());
+        let mut backend = crate::test_support::TestChain::new();
+        backend.1 = Some(gate.clone());
+        context.block_backend = Arc::new(backend);
         let block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
         let block_hash = block.block_hash();
         let proof_hash = BlockHash::from_byte_array([1; 32]);
@@ -2370,23 +2460,21 @@ mod tests {
             amount: 5_000,
             spk_ty: ScriptPubkeyType::PubKeyHash,
         };
-        let stored_block = UtreexoBlock {
-            block,
-            udata: Some(UData {
-                remember_idx: Vec::new(),
-                proof: BatchProof {
-                    targets: vec![VarInt(7)],
-                    hashes: vec![proof_hash],
-                },
-                leaves: vec![leaf.clone()],
-            }),
+        context.chainview.initialize(block.header).unwrap();
+        let udata = UData {
+            remember_idx: Vec::new(),
+            proof: BatchProof {
+                targets: vec![VarInt(7)],
+                hashes: vec![proof_hash],
+            },
+            leaves: vec![leaf.clone()],
         };
-        let index = context
+        context
             .proof_backend
             .write()
             .expect("lock test block file")
-            .append(&stored_block);
-        context.proof_index.append(index, block_hash);
+            .put(0, block_hash, &udata)
+            .unwrap();
         let expected_proof = UtreexoProof {
             block_hash,
             proof_hashes: vec![proof_hash],
@@ -2478,6 +2566,22 @@ mod tests {
             client,
         )
         .expect("complete active peer handshake");
+        protocol
+            .write(&Payload::genuine(
+                V2Codec::encode(&V2Message::Bitcoin(NetworkMessage::GetData(vec![
+                    Inventory::WitnessBlock(block_hash),
+                ])))
+                .unwrap(),
+            ))
+            .unwrap();
+        let (state, _) = gate
+            .changed
+            .wait_timeout_while(gate.state.lock().unwrap(), Duration::from_secs(5), |s| !s.0)
+            .unwrap();
+        assert!(state.0, "backend fetch started");
+        drop(state);
+        // The backend remains blocked while this same socket receives a pong
+        // and a proof read exclusively from local proof storage.
         let ping =
             V2Codec::encode(&V2Message::Bitcoin(NetworkMessage::Ping(42))).expect("encode ping");
         protocol
@@ -2509,6 +2613,15 @@ mod tests {
             expected_proof
         );
 
+        gate.state.lock().unwrap().1 = true;
+        gate.changed.notify_all();
+        let response = protocol.read().expect("receive Core-backed block");
+        let (id, payload) = response.contents().split_first().unwrap();
+        assert_eq!(*id, 2);
+        assert_eq!(
+            deserialize::<bitcoin::Block>(payload).unwrap().block_hash(),
+            block_hash
+        );
         drop(protocol);
         drop(malicious_protocol);
         drop(slow_clients);
@@ -2576,6 +2689,8 @@ mod tests {
         assert!(services.has(ServiceFlags::WITNESS));
         assert!(services.has(ServiceFlags::from(1 << 12)));
         assert!(!services.has(ServiceFlags::from(1 << 24)));
+        assert!(!services.has(ServiceFlags::NETWORK));
+        assert!(!services.has(ServiceFlags::from(1 << 13)));
     }
 
     #[test]

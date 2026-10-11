@@ -1,5 +1,31 @@
 # Storage and recovery
 
+## Block archive and proof retention
+
+Bitcoin Core (or the configured `Blockchain` backend) owns the Bitcoin block
+archive. The bridge stores no block bodies. `proofs/` holds one atomic proof-only
+record per retained height; REST combines those proofs with backend block data
+on demand. P2P proof requests read only local proofs. P2P block requests go through
+bounded background workers, so an RPC stall does not block pings or proofs.
+
+`--proof-retention 288` is the default. Values must be positive. Proof files older
+than that rolling window are removed from disk, and orphaned future records are
+removed during recovery. Historical roots and leaf counts are retained for every
+processed active-chain block regardless of proof retention. `--save-proofs-after`
+is an additional **absolute height cutoff**, not a window size.
+
+The bridge advertises `NODE_UTREEXO`, witness, and P2PV2. It adds
+`NODE_NETWORK_LIMITED` when it has proofs for the latest 288 processed blocks
+(or every block of a shorter chain). It does not advertise historical proof/archive
+service. Windows below 288 and gaps caused by `--save-proofs-after` can prevent
+limited-service advertisement.
+
+The backend must retain the blocks clients request. An archival Core backend is
+recommended. Sync and outpoint membership do not require `txindex`; legacy
+transaction-by-ID endpoints use `getrawtransaction` and require that index.
+
+## Processed state
+
 The processed tip is identified by **height and block hash**. Leaves, headers,
 historical accumulator states, and recovery deltas are published in one atomic
 database batch per block. REST proof queries execute between those batches and

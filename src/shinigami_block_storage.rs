@@ -1,18 +1,15 @@
 use std::fs::DirBuilder;
-use std::fs::File;
 use std::path::PathBuf;
 
-use bitcoin::Block;
+use bitcoin::BlockHash;
 use rustreexo::accumulator::mem_forest::MemForest;
 use rustreexo::accumulator::proof::Proof;
 use serde::Serialize;
 
-use crate::block_index::BlockIndex;
 use crate::prover::AccumulatorHash;
 use crate::prover::BlockStorage;
 use crate::udata::shinigami_udata::PoseidonHash;
 use crate::udata::LeafContext;
-use crate::udata::UtreexoBlock;
 
 #[derive(Debug, Serialize)]
 pub struct UtreexoState {
@@ -41,12 +38,12 @@ impl JsonBlockFiles {
 impl BlockStorage for JsonBlockFiles {
     fn save_block(
         &mut self,
-        _block: &Block,
+        _hash: BlockHash,
         block_height: u32,
         proof: Proof<AccumulatorHash>,
         _leaves: Vec<LeafContext>,
         acc: &MemForest<AccumulatorHash>,
-    ) -> BlockIndex {
+    ) -> anyhow::Result<()> {
         let block_data = BlockData {
             block_height,
             utreexo_state: UtreexoState {
@@ -59,20 +56,12 @@ impl BlockStorage for JsonBlockFiles {
         let subdir_name = block_height - (block_height % self.granularity);
         let file_path = self.dir.join(subdir_name.to_string());
 
-        DirBuilder::new()
-            .recursive(true)
-            .create(&file_path)
-            .unwrap();
+        DirBuilder::new().recursive(true).create(&file_path)?;
 
         let file_path = file_path.join(format!("{}.json", block_height));
-        let mut file = File::create(file_path).unwrap();
-
-        serde_json::to_writer(&mut file, &block_data).unwrap();
-
-        BlockIndex { offset: 0, size: 0 }
-    }
-
-    fn get_block(&self, _index: BlockIndex) -> Option<UtreexoBlock> {
-        unimplemented!()
+        crate::checkpoint::atomic_write(&file_path, |writer| {
+            serde_json::to_writer(writer, &block_data)?;
+            Ok(())
+        })
     }
 }

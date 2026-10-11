@@ -9,8 +9,11 @@ use std::sync::{mpsc::Sender, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
+#[cfg(feature = "api")]
 use bitcoin::consensus::serialize;
-use bitcoin::{Block, BlockHash, OutPoint, Script, Transaction, TxOut, Txid};
+use bitcoin::{Block, BlockHash, OutPoint, Script};
+#[cfg(feature = "api")]
+use bitcoin::{Transaction, TxOut, Txid};
 #[cfg(feature = "api")]
 use futures::channel::mpsc::Receiver;
 use log::{error, info};
@@ -20,11 +23,12 @@ use rustreexo::accumulator::{node_hash::BitcoinNodeHash, stump::Stump};
 #[cfg(feature = "api")]
 use serde::{Deserialize, Serialize};
 
-use crate::block_index::{BlockIndex, BlocksIndex};
 use crate::chaininterface::Blockchain;
 use crate::chainview::{ChainView, Delta, LeafChange, Tip};
 use crate::checkpoint::{acc_bytes, Checkpoints};
-use crate::udata::{LeafContext, LeafData, UtreexoBlock};
+use crate::udata::{LeafContext, LeafData};
+#[cfg(feature = "api")]
+use crate::udata::{UData, UtreexoBlock};
 
 #[cfg(not(feature = "shinigami"))]
 pub type AccumulatorHash = rustreexo::accumulator::node_hash::BitcoinNodeHash;
@@ -34,14 +38,17 @@ pub type AccumulatorHash = crate::udata::shinigami_udata::PoseidonHash;
 pub trait BlockStorage {
     fn save_block(
         &mut self,
-        block: &Block,
+        hash: BlockHash,
         height: u32,
         proof: Proof<AccumulatorHash>,
         leaves: Vec<LeafContext>,
         acc: &MemForest<AccumulatorHash>,
-    ) -> BlockIndex;
-    #[cfg_attr(feature = "shinigami", allow(unused))]
-    fn get_block(&self, index: BlockIndex) -> Option<UtreexoBlock>;
+    ) -> Result<()>;
+    fn prune(&mut self, _height: u32) -> Result<()> {
+        Ok(())
+    }
+    #[cfg(feature = "api")]
+    fn get_proof(&self, height: u32, hash: BlockHash) -> Result<Option<UData>>;
 }
 
 pub trait LeafCache {
@@ -79,7 +86,6 @@ pub struct Prover<LeafStorage: LeafCache, Storage: BlockStorage> {
     files: Arc<RwLock<Storage>>,
     rpc: Box<dyn Blockchain>,
     acc: MemForest<AccumulatorHash>,
-    storage: Arc<BlocksIndex>,
     tip: Tip,
     view: Arc<ChainView>,
     leaf_data: LeafStorage,
@@ -94,7 +100,6 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         rpc: Box<dyn Blockchain>,
-        storage: Arc<BlocksIndex>,
         files: Arc<RwLock<S>>,
         view: Arc<ChainView>,
         mut leaf_data: L,
@@ -116,6 +121,10 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
         let tip = view.tip()?.context("missing committed tip")?;
         let checkpoints = Checkpoints::new(crate::subdir("checkpoints").into())?;
         let acc = checkpoints.restore(&view, tip)?;
+        files
+            .write()
+            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?
+            .prune(tip.height)?;
         if tip.height == 0 {
             checkpoints.save(&view, tip, &acc)?;
         }
@@ -132,7 +141,6 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
         Ok(Self {
             rpc,
             files,
-            storage,
             view,
             leaf_data,
             tip,
@@ -218,17 +226,18 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
             .view
             .get_block_hash(height)?
             .context("unknown block height")?;
-        let index = self
-            .storage
-            .get_index(hash)
-            .context("block proof is unavailable")?;
-        let block = self
+        let udata = self
             .files
             .read()
             .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?
-            .get_block(index)
-            .context("block proof is unavailable")?;
-        Ok(serialize(&block))
+            .get_proof(height, hash)?
+            .context("block proof is pruned or unavailable")?;
+        let block = self.rpc.get_block(hash)?;
+        ensure!(block.block_hash() == hash, "backend returned wrong block");
+        Ok(serialize(&UtreexoBlock {
+            block,
+            udata: Some(udata),
+        }))
     }
 
     pub fn keep_up(
@@ -334,6 +343,10 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
         }
         self.view.flush()?;
         self.checkpoints.discard_after(&self.view, height)?;
+        self.files
+            .write()
+            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?
+            .prune(height)?;
         self.tip = ancestor;
         self.acc = acc;
         self.leaf_data.reload(&self.view)?;
@@ -359,18 +372,16 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
         let proof = self.acc.prove(&dels).map_err(anyhow::Error::msg)?;
         self.acc.modify(&adds, &dels).map_err(anyhow::Error::msg)?;
         if delta.tip.height > self.save_proofs_after {
-            let index = self
-                .files
+            self.files
                 .write()
                 .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?
                 .save_block(
-                    block,
+                    delta.tip.block_hash,
                     delta.tip.height,
                     proof,
                     delta.dels.clone(),
                     &self.acc,
-                );
-            self.storage.append(index, delta.tip.block_hash);
+                )?;
         }
         // Any error after forest modification is fatal to this process. Restart
         // reconstructs from the committed DB and never checkpoints partial work.
@@ -378,7 +389,12 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
             .commit(&delta, &block.header, &acc_bytes(&self.acc))?;
         self.leaf_data.apply(&delta.changes);
         self.tip = delta.tip;
-        self.storage.update_height(self.tip.height as usize);
+        // Do not prune a proof that a durable (older) tip might still require.
+        self.view.flush()?;
+        self.files
+            .write()
+            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?
+            .prune(self.tip.height)?;
         if self.tip.height % self.checkpoint_interval == 0 {
             self.checkpoints.save(&self.view, self.tip, &self.acc)?;
         }
@@ -512,16 +528,17 @@ mod tests {
     impl BlockStorage for NoBlocks {
         fn save_block(
             &mut self,
-            _: &Block,
+            _: BlockHash,
             _: u32,
             _: Proof<AccumulatorHash>,
             _: Vec<LeafContext>,
             _: &MemForest<AccumulatorHash>,
-        ) -> BlockIndex {
-            BlockIndex { offset: 0, size: 0 }
+        ) -> Result<()> {
+            Ok(())
         }
-        fn get_block(&self, _: BlockIndex) -> Option<UtreexoBlock> {
-            None
+        #[cfg(feature = "api")]
+        fn get_proof(&self, _: u32, _: BlockHash) -> Result<Option<UData>> {
+            Ok(None)
         }
     }
 
@@ -537,9 +554,6 @@ mod tests {
         Prover {
             rpc: Box::new(chain.clone()),
             files: Arc::new(RwLock::new(NoBlocks)),
-            storage: Arc::new(BlocksIndex {
-                database: store(&dir.join("index")),
-            }),
             acc,
             tip,
             leaf_data: DiskLeafStorage::new(view.clone()),
