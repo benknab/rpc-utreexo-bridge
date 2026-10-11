@@ -111,6 +111,15 @@ struct BlockStats {
     checkpoint_us: u128,
 }
 
+#[derive(Debug)]
+struct BackendUnavailable;
+
+impl std::fmt::Display for BackendUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("backend block hash unavailable")
+    }
+}
+
 fn elapsed_us(since: &mut Instant) -> u128 {
     let now = Instant::now();
     let elapsed = now.duration_since(*since).as_micros();
@@ -312,7 +321,13 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                 match self.rpc.get_block_count() {
                     Ok(height) => {
                         target = u32::try_from(height)?;
-                        self.reconcile(target)?;
+                        if let Err(error) = self.reconcile(target) {
+                            if !error.is::<BackendUnavailable>() {
+                                return Err(error);
+                            }
+                            error!("Backend tip unavailable: {error:#}");
+                            target = self.tip.height;
+                        }
                     }
                     Err(e) => {
                         error!("Backend tip unavailable: {e}");
@@ -376,7 +391,12 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
     /// Detect longer, equal-height and rollback-only reorganizations by hash.
     fn reconcile(&mut self, backend_height: u32) -> Result<()> {
         let mut height = self.tip.height.min(backend_height);
-        while self.view.get_block_hash(height)? != Some(self.rpc.get_block_hash(u64::from(height))?)
+        while self.view.get_block_hash(height)?
+            != Some(
+                self.rpc
+                    .get_block_hash(u64::from(height))
+                    .context(BackendUnavailable)?,
+            )
         {
             ensure!(height > 0, "backend genesis changed");
             height -= 1;

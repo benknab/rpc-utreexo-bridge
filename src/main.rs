@@ -51,8 +51,8 @@ use std::env;
 
 use anyhow::Result;
 use bitcoincore_rpc::Auth;
-use bitcoincore_rpc::Client;
 use chaininterface::Blockchain;
+use chaininterface::CoreRpc;
 use dotenv::dotenv;
 use jemallocator::Jemalloc;
 use log::info;
@@ -116,7 +116,8 @@ fn get_chain_provider() -> Result<Box<dyn Blockchain>> {
     if let Ok(esplora_url) = env::var("ESPLORA_URL") {
         return Ok(Box::new(esplora::EsploraBlockchain::new(esplora_url)));
     }
-    let rpc_url = env::var("BITCOIN_CORE_RPC_URL").unwrap_or_else(|_| "localhost:8332".into());
+    let rpc_url =
+        env::var("BITCOIN_CORE_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8332".into());
     // try to use username and password auth first
     if let Ok(username) = env::var("BITCOIN_CORE_RPC_USER") {
         let password = env::var("BITCOIN_CORE_RPC_PASSWORD").map_err(|_| {
@@ -126,7 +127,7 @@ fn get_chain_provider() -> Result<Box<dyn Blockchain>> {
             "Using bitcoin core at {} with username {}",
             rpc_url, username
         );
-        let client = Client::new(&rpc_url, Auth::UserPass(username, password));
+        let client = CoreRpc::new(&rpc_url, Auth::UserPass(username, password));
         match client {
             Ok(client) => {
                 return Ok(Box::new(client));
@@ -134,14 +135,14 @@ fn get_chain_provider() -> Result<Box<dyn Blockchain>> {
             Err(e) => return Err(anyhow::anyhow!("Couldn't connect to bitcoin core: {e}")),
         }
     }
-    // fallback to cookie auth. This is the default for core, but discouraged for security reasons
+    // Core's cookie rotates on restart; CoreRpc refreshes it between calls.
     let cookie = env::var("BITCOIN_CORE_COOKIE_FILE").unwrap_or_else(|_| {
         env::var("HOME")
             .map(|home| format!("{}/.bitcoin/.cookie", home))
             .expect("Failed to find $HOME")
     });
     info!("Using cookie file at {}", cookie);
-    let client = Client::new(&rpc_url, Auth::CookieFile(cookie.clone().into()));
+    let client = CoreRpc::new(&rpc_url, Auth::CookieFile(cookie.clone().into()));
     match client {
         Ok(client) => {
             info!("Using bitcoin core at {}", rpc_url);

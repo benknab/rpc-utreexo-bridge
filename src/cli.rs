@@ -1,6 +1,10 @@
 use bitcoin::network::Network;
 use clap::Parser;
 
+fn network(value: &str) -> Result<Network, bitcoin::network::ParseNetworkError> {
+    value.parse().or_else(|_| Network::from_core_arg(value))
+}
+
 #[derive(Debug, Parser)]
 pub struct CliArgs {
     /// Legacy snapshot height (unsupported: rebuild in a fresh DATA_DIR).
@@ -31,7 +35,7 @@ pub struct CliArgs {
     #[clap(long, default_value_t = 288)]
     pub proof_retention: u32,
 
-    /// The network we are operating on
-    #[clap(long, short = 'n', default_value = "bitcoin")]
+    /// Bitcoin network (also accepts Core's main/test chain names).
+    #[clap(long, short = 'n', default_value = "bitcoin", value_parser = network)]
     pub network: Network,
 }

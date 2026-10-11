@@ -254,6 +254,10 @@ def main():
             captured = get(api + f"/leaf/{outpoint}/proof")
             assert captured["state"]["height"] == 102
             verify(captured["leaf"], captured["proof"], get(api + f"/roots/{tip_hash}"))
+            bridge.send_signal(signal.SIGTERM)
+            assert bridge.wait(timeout=15) == 0
+            bridge = start(command, "bridge", env)
+            wait(lambda: get(api + "/acc") == captured["state"], "SIGTERM restart")
 
             def check_consumer(spent):
                 if args.consumer_project:
@@ -434,6 +438,7 @@ def main():
                             "leaf/roots/targets",
                             "post-spend historical verification",
                             "pruning",
+                            "SIGTERM shutdown",
                             "SIGKILL recovery",
                             "equal-height reorg",
                         ],

@@ -15,7 +15,7 @@ It contains multiple components:
 
 - Rust 1.85.0 or later
 - Linux or MacOS
-- Because just keep things on RAM, you'll need a machine with at least 16GB of RAM.
+- The forest stays in RAM. Memory use depends on the live UTXO set; see the measured fixtures and full-scale measurement procedure in [storage and recovery](docs/STORAGE.md).
 - Disk for the accumulator, leaf index, historical roots, checkpoints, and a configurable window of block proofs. Bitcoin Core retains the only block archive; see [storage and recovery](docs/STORAGE.md).
 - A trusted source of blocks to connect to. You can use Bitcoin Core.
 
@@ -40,6 +40,9 @@ or you can pull it from dockerhub:
 ```bash
 docker pull dlsz/bridge
 ```
+
+For a complete Core-backed stack with persistent volumes and cookie authentication,
+see the [Docker Compose guide](docs/signet-setup.md).
 
 ## Using
 

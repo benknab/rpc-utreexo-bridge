@@ -1,45 +1,69 @@
-version: "3"
-
 services:
   bitcoind:
-    image: ruimarinho/bitcoin-core:latest
-    restart: always
-    entrypoint: bitcoind -txindex=1 -signet -rpcuser=$RPC_USER -rpcpassword=$RPC_PASSWORD -rpcbind=0.0.0.0:38332 -rpcallowip=255.255.255.255/0
-    container_name: bitcoind
-    environment:
-      - RPC_USER=${RPC_USER}
-      - RPC_PASSWORD=${RPC_PASSWORD}
+    image: bitcoin/bitcoin:30.2
+    restart: unless-stopped
+    stop_grace_period: 5m
+    command:
+      - -chain=${BITCOIN_CHAIN:-signet}
+      - -server=1
+      - -txindex=0
+      - -prune=0
+      - -rpcport=8332
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpccookiefile=/home/bitcoin/.bitcoin/.bridge-cookie
     volumes:
-      - ./bitcoind/:$HOME/.bitcoin
-    ports:
-      - 38332:38332
-    networks:
-      - local-network
+      - core-data:/home/bitcoin/.bitcoin
+    healthcheck:
+      test:
+        - CMD
+        - bitcoin-cli
+        - -chain=${BITCOIN_CHAIN:-signet}
+        - -rpcport=8332
+        - -rpccookiefile=/home/bitcoin/.bitcoin/.bridge-cookie
+        - getblockchaininfo
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
-  brige:
+  bridge:
+    image: ${BRIDGE_IMAGE:-rpc-utreexo-bridge:local}
     build:
       context: .
-      dockerfile: Dockerfile
-    restart: always
-    entrypoint: ./bridge
-    container_name: bridge
+      args:
+        BRIDGE_REVISION: ${BRIDGE_REVISION:-unknown}
+    restart: unless-stopped
+    stop_grace_period: 5m
+    command:
+      - --network
+      - ${BITCOIN_CHAIN:-signet}
+      - --proof-retention
+      - ${PROOF_RETENTION:-288}
+      - --acc-snapshot-every-n-blocks
+      - ${CHECKPOINT_INTERVAL:-1000}
     environment:
-      - BITCOIN_CORE_RPC_URL=bitcoind:38332
-      - BITCOIN_CORE_RPC_USER=${RPC_USER}
-      - BITCOIN_CORE_RPC_PASSWORD=${RPC_PASSWORD}
-      - P2P_PORT=${P2P_PORT}
-      - API_PORT=${API_PORT}
-      - DATA_DIR=$HOME/.bridge
+      BITCOIN_CORE_RPC_URL: http://bitcoind:8332
+      BITCOIN_CORE_COOKIE_FILE: /core/.bridge-cookie
+      API_HOST: 0.0.0.0:3000
+      P2P_HOST: 0.0.0.0
+      P2P_PORT: "8333"
+      DATA_DIR: /app/data
     volumes:
-      - ./bridge/:$HOME/.bridge
+      - bridge-data:/app/data
+      - core-data:/core:ro
     ports:
-      - $P2P_PORT:$P2P_PORT
-      - $API_PORT:$API_PORT
-    networks:
-      - local-network
+      - "127.0.0.1:${API_PORT:-8080}:3000"
+      - "${P2P_PORT:-38333}:8333"
     depends_on:
-      - bitcoind
+      bitcoind:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:3000/tip"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
 
-networks:
-  local-network:
-    driver: bridge
+volumes:
+  core-data:
+  bridge-data:

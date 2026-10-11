@@ -80,6 +80,11 @@ pub fn run_bridge() -> anyhow::Result<()> {
     let leaf_data = HashMap::new();
 
     let kill_signal = Arc::new(Mutex::new(false));
+    let stop = kill_signal.clone();
+    ctrlc::set_handler(move || {
+        warn!("Received a stop signal");
+        *stop.lock().unwrap() = true;
+    })?;
     let (sender, recv) = channel();
     let mut prover = prover::Prover::new(
         client,
@@ -97,11 +102,6 @@ pub fn run_bridge() -> anyhow::Result<()> {
     // Keep the prover running in the background, it will download blocks and
     // create proofs for them as they are mined.
     info!("Running prover");
-    ctrlc::set_handler(move || {
-        warn!("Received a stop signal");
-        *kill_signal.lock().unwrap() = true;
-    })?;
-
     prover.keep_up(cli_options.stop_height)?;
     drop(recv); // Don't let the receiver drop early, this will cause trouble inside the prover
 

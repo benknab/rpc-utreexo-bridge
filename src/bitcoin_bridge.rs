@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
-use actix_rt::signal::ctrl_c;
 use anyhow::Context;
 use bitcoin::constants::genesis_block;
 use clap::Parser;
@@ -83,6 +82,11 @@ pub fn run_bridge() -> anyhow::Result<()> {
 
     // a signal used to stop the prover
     let kill_signal = Arc::new(Mutex::new(false));
+    let stop = kill_signal.clone();
+    ctrlc::set_handler(move || {
+        warn!("Received a stop signal");
+        *stop.lock().unwrap() = true;
+    })?;
 
     //let leaf_data = HashMap::new(); // In-memory leaf storage,
     // faster than leaf_data but uses more memory
@@ -136,13 +140,5 @@ pub fn run_bridge() -> anyhow::Result<()> {
     // Keep the prover running in the background, it will download blocks and
     // create proofs for them as they are mined.
     info!("Running prover");
-    std::thread::spawn(move || {
-        actix_rt::System::new().block_on(async {
-            let _ = ctrl_c().await;
-            warn!("Received a stop signal");
-            *kill_signal.lock().unwrap() = true;
-        })
-    });
-
     prover.keep_up(cli_options.stop_height, receiver)
 }
