@@ -312,8 +312,7 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                     target = self.tip.height;
                     continue;
                 }
-                let mtp = self.rpc.get_mtp(self.tip.block_hash)?;
-                self.connect_block(&block, mtp)?;
+                self.connect_block(&block)?;
                 if self.tip.height == target {
                     let _ = self.block_notification.send(self.tip.block_hash);
                     self.view.flush()?;
@@ -370,12 +369,12 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
         Ok(())
     }
 
-    fn connect_block(&mut self, block: &Block, mtp: u32) -> Result<()> {
+    fn connect_block(&mut self, block: &Block) -> Result<()> {
         ensure!(
             block.header.prev_blockhash == self.tip.block_hash,
             "block parent mismatch"
         );
-        let delta = self.prepare(block, mtp)?;
+        let delta = self.prepare(block, self.view.median_time_past(self.tip)?)?;
         let adds = delta
             .adds
             .iter()
@@ -594,7 +593,7 @@ mod tests {
         let coin = outpoint(&first.txdata[0]);
         let mut p = prover(&dir, &chain);
         chain.0.write().unwrap().push(first.clone());
-        p.connect_block(&first, 0).unwrap();
+        p.connect_block(&first).unwrap();
         let leaf = p.lookup_leaf(&coin).unwrap();
         let hash = LeafData::get_leaf_hashes(&leaf);
         let old_proof = p.acc.prove(&[hash]).unwrap();
@@ -608,11 +607,11 @@ mod tests {
         }
         let second = block(&first, 2, vec![transaction(coin, 20)]);
         chain.0.write().unwrap().push(second.clone());
-        p.connect_block(&second, 0).unwrap(); // checkpoint
+        p.connect_block(&second).unwrap(); // checkpoint
         assert!(p.lookup_leaf(&coin).is_err());
         let third = block(&second, 3, vec![]);
         chain.0.write().unwrap().push(third.clone());
-        p.connect_block(&third, 0).unwrap(); // journal only
+        p.connect_block(&third).unwrap(); // journal only
         let expected = acc_bytes(&p.acc);
         p.view.flush().unwrap();
         let partial = dir.join("checkpoints/0000000003-interrupted.tmp");
@@ -643,7 +642,7 @@ mod tests {
         chain.0.write().unwrap()[3] = replacement.clone();
         p.reconcile(3).unwrap();
         assert_eq!(p.tip.block_hash, second.block_hash());
-        p.connect_block(&replacement, 0).unwrap();
+        p.connect_block(&replacement).unwrap();
         assert!(p.view.active_tip_for(third.block_hash()).unwrap().is_none());
 
         // A rollback below the most recent checkpoint restores the spent coin.
@@ -654,23 +653,68 @@ mod tests {
     }
 
     #[test]
+    fn parent_median_time_uses_local_headers_after_restart_and_reorg() {
+        let dir = TestDir::new();
+        let chain = TestChain::new();
+        let mut p = prover(&dir, &chain);
+        let mut parent = chain.0.read().unwrap()[0].clone();
+        let genesis_time = parent.header.time;
+        assert_eq!(p.view.median_time_past(p.tip).unwrap(), genesis_time);
+        // Unordered timestamps distinguish a median from the parent's timestamp.
+        for (index, offset) in [120, 40, 200, 20, 80, 70, 180, 160, 30, 130, 150, 210]
+            .into_iter()
+            .enumerate()
+        {
+            let mut next = block(&parent, index as u8 + 1, vec![]);
+            next.header.time = genesis_time + offset;
+            chain.0.write().unwrap().push(next.clone());
+            p.connect_block(&next).unwrap();
+            let leaf = p.lookup_leaf(&outpoint(&next.txdata[0])).unwrap();
+            if index == 0 {
+                assert_eq!(leaf.median_time_past, genesis_time);
+            } else if index == 1 || index == 11 {
+                // Two headers use the upper median; height 12 excludes genesis.
+                assert_eq!(leaf.median_time_past, genesis_time + 120);
+            }
+            parent = next;
+        }
+        drop(p);
+        let mut p = prover(&dir, &chain);
+        chain.0.write().unwrap().truncate(11);
+        p.reconcile(10).unwrap();
+        parent = chain.0.read().unwrap()[10].clone();
+        for (tag, offset) in [(21, 1), (22, 220)] {
+            let mut next = block(&parent, tag, vec![]);
+            next.header.time = genesis_time + offset;
+            chain.0.write().unwrap().push(next.clone());
+            p.connect_block(&next).unwrap();
+            parent = next;
+        }
+        let leaf = p.lookup_leaf(&outpoint(&parent.txdata[0])).unwrap();
+        assert_eq!(leaf.median_time_past, genesis_time + 80);
+        drop(p);
+        let p = prover(&dir, &chain);
+        assert_eq!(p.lookup_leaf(&outpoint(&parent.txdata[0])).unwrap(), leaf);
+    }
+
+    #[test]
     fn same_block_spends_are_excluded_and_recovery_is_bounded() {
         let dir = TestDir::new();
         let chain = TestChain::new();
         let mut p = prover(&dir, &chain);
         let mut parent = chain.0.read().unwrap()[0].clone();
         let first = block(&parent, 1, vec![]);
-        p.connect_block(&first, 0).unwrap();
+        p.connect_block(&first).unwrap();
         let created = transaction(outpoint(&first.txdata[0]), 10);
         let consumed = outpoint(&created);
         let second = block(&first, 2, vec![created, transaction(consumed, 11)]);
-        p.connect_block(&second, 0).unwrap();
+        p.connect_block(&second).unwrap();
         assert!(p.lookup_leaf(&consumed).is_err());
         assert_eq!(p.acc.leaves, 3); // first coinbase, second coinbase, final output
         parent = second;
         for height in 3..=6 {
             let next = block(&parent, height, vec![]);
-            p.connect_block(&next, 0).unwrap();
+            p.connect_block(&next).unwrap();
             parent = next;
         }
         assert!(p.view.delta(4).unwrap().is_none());

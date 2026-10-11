@@ -118,9 +118,6 @@ impl Blockchain for TestChain {
     fn get_raw_transaction_info(&self, _: &Txid) -> Result<TransactionInfo> {
         anyhow::bail!("txindex is unavailable")
     }
-    fn get_mtp(&self, _: BlockHash) -> Result<u32> {
-        Ok(0)
-    }
 }
 
 pub fn transaction(input: OutPoint, tag: u8) -> Transaction {

@@ -256,6 +256,25 @@ impl ChainView {
         Ok(self.data.get(&key(b'h', hash.as_byte_array()))?)
     }
 
+    /// Bitcoin's upper median of this block's time and up to ten ancestors.
+    /// Follow hash-bound headers so a concurrent reorg cannot mix branches.
+    pub fn median_time_past(&self, tip: Tip) -> Result<u32> {
+        let mut hash = tip.block_hash;
+        let mut times = Vec::with_capacity(11);
+        for _ in 0..=tip.height.min(10) {
+            let header: Header = deserialize(
+                &self
+                    .get_block(hash)?
+                    .context("missing median-time header")?,
+            )?;
+            ensure!(header.block_hash() == hash, "median-time header mismatch");
+            times.push(header.time);
+            hash = header.prev_blockhash;
+        }
+        times.sort_unstable();
+        Ok(times[times.len() / 2])
+    }
+
     pub fn get_block_hash(&self, height: u32) -> Result<Option<BlockHash>> {
         self.data
             .get(&key(b'n', &height.to_be_bytes()))?

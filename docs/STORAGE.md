@@ -27,6 +27,10 @@ The backend must retain the blocks clients request. An archival Core backend is
 recommended. Sync and outpoint membership do not require `txindex`; legacy
 transaction-by-ID endpoints use `getrawtransaction` and require that index.
 
+Sync fetches each block by hash. It computes the parent median time from the
+eleven most recent stored headers, avoiding an extra full-block metadata RPC
+request and giving Esplora-backed leaves the same median-time data.
+
 ## Processed state
 
 The processed tip is identified by **height and block hash**. Leaves, headers,
