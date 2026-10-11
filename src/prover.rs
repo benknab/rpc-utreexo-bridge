@@ -98,6 +98,26 @@ pub struct Prover<LeafStorage: LeafCache, Storage: BlockStorage> {
     block_notification: Sender<BlockHash>,
 }
 
+struct BlockStats {
+    adds: usize,
+    dels: usize,
+    prepare_us: u128,
+    prove_us: u128,
+    modify_us: u128,
+    proof_write_us: u128,
+    commit_us: u128,
+    flush_us: u128,
+    prune_us: u128,
+    checkpoint_us: u128,
+}
+
+fn elapsed_us(since: &mut Instant) -> u128 {
+    let now = Instant::now();
+    let elapsed = now.duration_since(*since).as_micros();
+    *since = now;
+    elapsed
+}
+
 impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -122,7 +142,9 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
         view.initialize(rpc.get_block_header(genesis)?)?;
         let tip = view.tip()?.context("missing committed tip")?;
         let checkpoints = Checkpoints::new(crate::subdir("checkpoints").into())?;
+        let restore_started = Instant::now();
         let acc = checkpoints.restore(&view, tip)?;
+        let restore_us = restore_started.elapsed().as_micros();
         files
             .write()
             .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?
@@ -137,8 +159,8 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
         );
         leaf_data.reload(&view)?;
         info!(
-            "Restored accumulator at height={} hash={}",
-            tip.height, tip.block_hash
+            "Restored accumulator at height={} hash={} restore_us={}",
+            tip.height, tip.block_hash, restore_us
         );
         Ok(Self {
             rpc,
@@ -259,6 +281,7 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
 
     pub fn keep_up(
         &mut self,
+        stop_height: Option<u32>,
         #[cfg(feature = "api")] mut receiver: Receiver<(
             Requests,
             futures::channel::oneshot::Sender<Result<Responses, String>>,
@@ -269,6 +292,11 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
         loop {
             if *self.shutdown_flag.lock().unwrap() {
                 self.view.flush()?;
+                return Ok(());
+            }
+            if stop_height.is_some_and(|height| self.tip.height >= height) {
+                self.view.flush()?;
+                info!("Reached stop height={}", self.tip.height);
                 return Ok(());
             }
             #[cfg(feature = "api")]
@@ -293,6 +321,7 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                 }
             }
             if self.tip.height < target {
+                let block_started = Instant::now();
                 let height = self.tip.height + 1;
                 let fetched = self.rpc.get_block_hash(u64::from(height)).and_then(|hash| {
                     let block = self.rpc.get_block(hash)?;
@@ -312,7 +341,28 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                     target = self.tip.height;
                     continue;
                 }
-                self.connect_block(&block)?;
+                let fetch_us = block_started.elapsed().as_micros();
+                let stats = self.connect_block(&block)?;
+                info!(
+                    "processed height={} txs={} adds={} dels={} leaves={} fetch_us={} \
+                     prepare_us={} prove_us={} modify_us={} proof_write_us={} commit_us={} \
+                     flush_us={} prune_us={} checkpoint_us={} block_us={}",
+                    self.tip.height,
+                    block.txdata.len(),
+                    stats.adds,
+                    stats.dels,
+                    self.acc.leaves,
+                    fetch_us,
+                    stats.prepare_us,
+                    stats.prove_us,
+                    stats.modify_us,
+                    stats.proof_write_us,
+                    stats.commit_us,
+                    stats.flush_us,
+                    stats.prune_us,
+                    stats.checkpoint_us,
+                    block_started.elapsed().as_micros(),
+                );
                 if self.tip.height == target {
                     let _ = self.block_notification.send(self.tip.block_hash);
                     self.view.flush()?;
@@ -369,7 +419,8 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
         Ok(())
     }
 
-    fn connect_block(&mut self, block: &Block) -> Result<()> {
+    fn connect_block(&mut self, block: &Block) -> Result<BlockStats> {
+        let mut stage_started = Instant::now();
         ensure!(
             block.header.prev_blockhash == self.tip.block_hash,
             "block parent mismatch"
@@ -385,8 +436,11 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
             .iter()
             .map(LeafData::get_leaf_hashes)
             .collect::<Vec<_>>();
+        let prepare_us = elapsed_us(&mut stage_started);
         let proof = self.acc.prove(&dels).map_err(anyhow::Error::msg)?;
+        let prove_us = elapsed_us(&mut stage_started);
         self.acc.modify(&adds, &dels).map_err(anyhow::Error::msg)?;
+        let modify_us = elapsed_us(&mut stage_started);
         if delta.tip.height > self.save_proofs_after {
             self.files
                 .write()
@@ -399,27 +453,40 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                     &self.acc,
                 )?;
         }
+        let proof_write_us = elapsed_us(&mut stage_started);
         // Any error after forest modification is fatal to this process. Restart
         // reconstructs from the committed DB and never checkpoints partial work.
         self.view
             .commit(&delta, &block.header, &acc_bytes(&self.acc))?;
         self.leaf_data.apply(&delta.changes);
         self.tip = delta.tip;
+        let commit_us = elapsed_us(&mut stage_started);
         // Do not prune a proof that a durable (older) tip might still require.
         self.view.flush()?;
+        let flush_us = elapsed_us(&mut stage_started);
         self.files
             .write()
             .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?
             .prune(self.tip.height)?;
-        if self.tip.height % self.checkpoint_interval == 0 {
+        let prune_us = elapsed_us(&mut stage_started);
+        let checkpoint_us = if self.tip.height % self.checkpoint_interval == 0 {
             self.checkpoints.save(&self.view, self.tip, &self.acc)?;
-        }
-        info!(
-            "processed height={} txs={}",
-            self.tip.height,
-            block.txdata.len()
-        );
-        Ok(())
+            elapsed_us(&mut stage_started)
+        } else {
+            0
+        };
+        Ok(BlockStats {
+            adds: adds.len(),
+            dels: dels.len(),
+            prepare_us,
+            prove_us,
+            modify_us,
+            proof_write_us,
+            commit_us,
+            flush_us,
+            prune_us,
+            checkpoint_us,
+        })
     }
 
     /// Stage leaf changes without touching persistent or accumulator state.
@@ -650,6 +717,33 @@ mod tests {
         p.reconcile(1).unwrap();
         assert_eq!(p.lookup_leaf(&coin).unwrap(), leaf);
         assert!(p.acc.verify(&old_proof, &[hash]).unwrap());
+    }
+
+    #[test]
+    fn bounded_sync_stops_exactly_and_resumes_from_the_journal() {
+        let dir = TestDir::new();
+        let chain = TestChain::new();
+        let mut parent = chain.0.read().unwrap()[0].clone();
+        for tag in 1..=5 {
+            let next = block(&parent, tag, vec![]);
+            chain.0.write().unwrap().push(next.clone());
+            parent = next;
+        }
+        for height in [0, 3, 5] {
+            let mut p = prover(&dir, &chain);
+            p.keep_up(
+                Some(height),
+                #[cfg(feature = "api")]
+                futures::channel::mpsc::channel(1).1,
+            )
+            .unwrap();
+            assert_eq!(p.view.tip().unwrap().unwrap().height, height);
+            assert!(p.view.get_block_hash(height + 1).unwrap().is_none());
+            assert_eq!(
+                acc_bytes(&p.acc),
+                p.view.get_acc(p.tip.block_hash).unwrap().unwrap()
+            );
+        }
     }
 
     #[test]

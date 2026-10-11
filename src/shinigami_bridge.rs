@@ -102,7 +102,7 @@ pub fn run_bridge() -> anyhow::Result<()> {
         *kill_signal.lock().unwrap() = true;
     })?;
 
-    prover.keep_up()?;
+    prover.keep_up(cli_options.stop_height)?;
     drop(recv); // Don't let the receiver drop early, this will cause trouble inside the prover
 
     Ok(())

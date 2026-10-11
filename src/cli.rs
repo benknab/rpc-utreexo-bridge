@@ -13,6 +13,10 @@ pub struct CliArgs {
     #[clap(long)]
     pub acc_snapshot_every_n_blocks: Option<u32>,
 
+    /// Flush and exit once this processed height is reached (for bounded sync runs).
+    #[clap(long)]
+    pub stop_height: Option<u32>,
+
     /// In shinigami mode, we save blocks individually in a json file. We also place those json
     /// inside a directory that has a range of blocks (e.g. 0-1000). This parameter specifies the
     /// range of blocks that will be saved in each directory. The default value is 10_000.

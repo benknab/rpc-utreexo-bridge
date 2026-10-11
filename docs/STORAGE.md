@@ -87,3 +87,57 @@ proof files used 320 bytes; all eight retained blocks had no spent inputs. Total
 bridge file sizes were 1,069,837 bytes, including checkpoints, journal, leaf index,
 headers, roots, and the log. There was no bridge block archive. This small fixture
 does not estimate mainnet disk use, peak memory, or initial-sync throughput.
+
+A later optimized run on an M4 Pro with 24 GB RAM and local Core 30.2 processed
+172 regtest blocks containing 224 transactions and 16,404 spent inputs. The
+fixture kept 10,392 live outputs and used a 16-block checkpoint interval and
+eight-block proof window. Sync took 5.283 seconds, with 123 MiB peak resident
+memory and 66.7 MiB of final bridge files. Eight nonempty proofs used 68,864 bytes.
+Proof writes took 1.659 seconds, database flushes 1.307 seconds, pruning 0.821
+seconds, and ten checkpoints 0.293 seconds in total. Restart restored the forest
+in 33.7 ms, and its roots matched an independent Utreexod replay. Core had just
+generated the fixture; filesystem caches were not cleared. These are small,
+warm-regtest measurements, not a mainnet capacity or throughput estimate.
+
+## Repeatable sync measurements
+
+Build an optimized binary and select the backend with the normal RPC environment
+variables or `.env`. Then run on macOS or Linux with Python 3.11 or newer:
+
+```sh
+cargo build --locked --release
+python3 contrib/measure.py /path/to/new-measurement \
+  --stop-height 100000 --timeout 3600
+```
+
+The output directory must be new. The runner sets a fresh `DATA_DIR` inside it
+and binds REST/P2P to local ports. It retains `data/`, `process.log`, resource
+samples in `samples.jsonl`, and `summary.json`. Use `--network regtest` for a
+regtest backend. `--proof-retention` and `--checkpoint-interval` control the
+usual storage settings; their defaults remain 288 and 1000.
+
+`--stop-height` is also a bridge option. It flushes and exits at that height,
+even if the backend has advanced further. A later run can resume from the same
+data directory. The measurement runner always starts from genesis. A timeout
+keeps the partial measurements, exits nonzero, and marks the summary unsuccessful.
+
+The summary includes the binary hash, command, platform, wall time, CPU time,
+and the OS-reported peak resident memory of the bridge process. It reports final
+file sizes and allocated disk bytes by storage directory. Sampled disk peaks are
+estimates and can miss short-lived checkpoint files. Resident memory includes
+mapped file pages, but excludes Core and the unmapped filesystem cache. Sampling
+itself adds some overhead.
+
+Each processed-block log includes microseconds spent fetching, preparing leaves,
+proving, changing the forest, writing proofs, committing the database, flushing,
+pruning, and checkpointing. `block_us` covers those stages together; do not add it
+to the individual stage totals. Checkpoint time includes snapshot publication and
+journal pruning. Separate log lines report checkpoint size and restore time.
+`leaves` counts all accumulator insertions, including later spent leaves.
+
+Record the Core version, backend location, CPU/RAM/disk, height range, and whether
+the filesystem cache was warm alongside results. Compare identical block ranges
+and settings. Small regtest or early-mainnet ranges do not predict a full sync.
+
+`python3 contrib/regtest.py --measure` checks exact bounded sync, resource output,
+and unsuccessful timeout reporting against an isolated real Core node.

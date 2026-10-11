@@ -144,5 +144,5 @@ pub fn run_bridge() -> anyhow::Result<()> {
         })
     });
 
-    prover.keep_up(receiver)
+    prover.keep_up(cli_options.stop_height, receiver)
 }

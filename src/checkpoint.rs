@@ -162,6 +162,11 @@ impl Checkpoints {
             view.prune_journal(*oldest)?;
             view.flush()?;
         }
+        log::info!(
+            "checkpoint height={} bytes={}",
+            tip.height,
+            fs::metadata(path)?.len()
+        );
         Ok(())
     }
 

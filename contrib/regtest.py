@@ -132,6 +132,9 @@ def main():
         help="limited-zk-bip-322 checkout; runs its live bridge component tests",
     )
     parser.add_argument("--temp-parent")
+    parser.add_argument(
+        "--measure", action="store_true", help="also check the sync measurement runner"
+    )
     args = parser.parse_args()
     processes = []
     with tempfile.TemporaryDirectory(
@@ -361,6 +364,55 @@ def main():
             files = list((root / "bridge" / "proofs").glob("*.proof"))
             assert len(files) == 8
             assert not (root / "bridge" / "blocks").exists()
+            if args.measure:
+                measure = [
+                    "python3",
+                    str(Path(__file__).with_name("measure.py")),
+                    "--bridge",
+                    str(Path(args.bridge).resolve()),
+                    "--network",
+                    "regtest",
+                    "--proof-retention",
+                    "8",
+                    "--checkpoint-interval",
+                    "16",
+                    "--sample-seconds",
+                    "0.1",
+                ]
+                subprocess.run(
+                    [*measure, str(root / "measured"), "--stop-height", "120"],
+                    env=env,
+                    check=True,
+                    timeout=60,
+                    capture_output=True,
+                )
+                summary = json.loads((root / "measured/summary.json").read_text())
+                assert summary["success"] and summary["sync"]["blocks"] == 120
+                assert summary["sync"]["last_height"] == 120
+                assert summary["sync"]["stages"]["checkpoint"]["nonzero_blocks"] == 7
+                assert summary["final_storage"]["proofs"]["files"] == 8
+                assert summary["final_storage"]["checkpoints"]["files"] == 2
+                assert summary["peak_rss_bytes"] > 0
+                timed_out = subprocess.run(
+                    [
+                        *measure,
+                        str(root / "timed-out"),
+                        "--stop-height",
+                        "128",
+                        "--timeout",
+                        "2",
+                    ],
+                    env=env,
+                    check=False,
+                    timeout=30,
+                    capture_output=True,
+                )
+                assert timed_out.returncode == 1, timed_out.stderr
+                summary = json.loads((root / "timed-out/summary.json").read_text())
+                assert not summary["success"] and summary["stop_reason"] == "timeout"
+                assert (
+                    summary["returncode"] == 0
+                )  # Graceful partial sync is not benchmark success.
             print(
                 json.dumps(
                     {
@@ -370,6 +422,7 @@ def main():
                         "initial_sync_seconds": round(sync_seconds, 3),
                         "retained_proofs": len(files),
                         "consumer_checked": bool(args.consumer_project),
+                        "measurement_checked": args.measure,
                         "proof_bytes": sum(f.stat().st_size for f in files),
                         "txindex": False,
                         "bridge_file_bytes": sum(
