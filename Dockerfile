@@ -2,6 +2,7 @@ FROM rust:1.85.0-slim-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends g++ make pkg-config ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+ARG CARGO_BUILD_JOBS=4
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --locked --release
