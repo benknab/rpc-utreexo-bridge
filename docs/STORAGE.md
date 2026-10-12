@@ -38,6 +38,13 @@ explicitly if unavailable, and does not require Core 31. The Compose stack
 enables it by default. Core REST is unauthenticated; keep it on the private
 backend network. Responses are size-bounded, hash-checked, and never cached on disk.
 
+Initial sync uses one background download worker, a two-block memory queue, and
+hash batches of at most 128 (binary header batches with REST). Downloads overlap
+serial accumulator commits. Besides the block being processed, at most two blocks
+are queued and one is being downloaded. Reorgs discard queued work, and the owner
+checks each block's hash, height, and parent before applying it. `--stop-height`
+also caps read-ahead. A stalled downloader does not hold up witness requests.
+
 ## Processed state
 
 The processed tip is identified by **height and block hash**. Leaves, headers,
@@ -138,8 +145,10 @@ itself adds some overhead.
 
 Each processed-block log includes microseconds spent fetching, preparing leaves,
 proving, changing the forest, writing proofs, committing the database, flushing,
-pruning, and checkpointing. `block_us` covers those stages together; do not add it
-to the individual stage totals. Checkpoint time includes snapshot publication and
+pruning, and checkpointing. With prefetch, `fetch_us` measures background download
+time (including header discovery on the first block of a batch), which overlaps
+processing. `block_us` measures the owner's current receive/processing iteration;
+do not sum overlapping stage timings to infer wall time. Checkpoint time includes snapshot publication and
 journal pruning. Separate log lines report checkpoint size and restore time.
 `leaves` counts all accumulator insertions, including later spent leaves.
 

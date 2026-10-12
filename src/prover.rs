@@ -86,7 +86,7 @@ impl LeafCache for HashMap<OutPoint, LeafContext> {
 
 pub struct Prover<LeafStorage: LeafCache, Storage: BlockStorage> {
     files: Arc<RwLock<Storage>>,
-    rpc: Box<dyn Blockchain>,
+    rpc: Arc<dyn Blockchain>,
     acc: MemForest<AccumulatorHash>,
     tip: Tip,
     view: Arc<ChainView>,
@@ -172,7 +172,7 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
             tip.height, tip.block_hash, restore_us
         );
         Ok(Self {
-            rpc,
+            rpc: Arc::from(rpc),
             files,
             view,
             leaf_data,
@@ -298,6 +298,7 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
     ) -> Result<()> {
         let mut target = self.tip.height;
         let mut next_poll = Instant::now();
+        let mut prefetch = None;
         loop {
             if *self.shutdown_flag.lock().unwrap() {
                 self.view.flush()?;
@@ -321,6 +322,7 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                 match self.rpc.get_block_count() {
                     Ok(height) => {
                         target = u32::try_from(height)?;
+                        let old_tip = self.tip;
                         if let Err(error) = self.reconcile(target) {
                             if !error.is::<BackendUnavailable>() {
                                 return Err(error);
@@ -328,35 +330,50 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                             error!("Backend tip unavailable: {error:#}");
                             target = self.tip.height;
                         }
+                        if self.tip != old_tip || target <= self.tip.height {
+                            prefetch = None;
+                        }
                     }
                     Err(e) => {
                         error!("Backend tip unavailable: {e}");
                         target = self.tip.height;
+                        prefetch = None;
                     }
                 }
             }
             if self.tip.height < target {
                 let block_started = Instant::now();
                 let height = self.tip.height + 1;
-                let fetched = self.rpc.get_block_hash(u64::from(height)).and_then(|hash| {
-                    let block = self.rpc.get_block(hash)?;
-                    ensure!(block.block_hash() == hash, "backend returned wrong block");
-                    Ok(block)
-                });
-                let block = match fetched {
-                    Ok(block) => block,
+                if prefetch.is_none() {
+                    prefetch = Some(crate::prefetch::Prefetch::new(
+                        self.rpc.clone(),
+                        height,
+                        target.min(stop_height.unwrap_or(u32::MAX)),
+                    )?);
+                }
+                let fetched = match prefetch.as_ref().unwrap().next() {
+                    Ok(crate::prefetch::Next::Block(block)) => block,
+                    Ok(crate::prefetch::Next::Pending) => continue,
+                    Ok(crate::prefetch::Next::Finished) => {
+                        prefetch = None;
+                        continue;
+                    }
                     Err(e) => {
                         error!("Backend block unavailable: {e}");
                         target = self.tip.height;
+                        prefetch = None;
                         continue;
                     }
                 };
+                ensure!(fetched.height == height, "prefetch height mismatch");
+                let block = fetched.block;
                 if block.header.prev_blockhash != self.tip.block_hash {
                     next_poll = Instant::now();
                     target = self.tip.height;
+                    prefetch = None;
                     continue;
                 }
-                let fetch_us = block_started.elapsed().as_micros();
+                let fetch_us = fetched.fetch_us;
                 let stats = self.connect_block(&block)?;
                 info!(
                     "processed height={} txs={} adds={} dels={} leaves={} fetch_us={} \
@@ -657,7 +674,7 @@ mod tests {
             checkpoints.save(&view, tip, &acc).unwrap();
         }
         Prover {
-            rpc: Box::new(chain.clone()),
+            rpc: Arc::new(chain.clone()),
             files: Arc::new(RwLock::new(NoBlocks)),
             acc,
             tip,
@@ -764,6 +781,53 @@ mod tests {
                 p.view.get_acc(p.tip.block_hash).unwrap().unwrap()
             );
         }
+    }
+
+    #[cfg(feature = "api")]
+    #[test]
+    fn stalled_prefetch_keeps_state_queries_responsive() {
+        use crate::test_support::FetchGate;
+        let dir = TestDir::new();
+        let mut chain = TestChain::new();
+        let mut p = prover(&dir, &chain);
+        let parent = chain.0.read().unwrap()[0].clone();
+        chain.0.write().unwrap().push(block(&parent, 1, vec![]));
+        let gate = Arc::new(FetchGate::default());
+        chain.1 = Some(gate.clone());
+        p.rpc = Arc::new(chain);
+        let shutdown = p.shutdown_flag.clone();
+        let (mut sender, receiver) = futures::channel::mpsc::channel(1);
+        let query = std::thread::spawn(move || {
+            let (state, _) = gate
+                .changed
+                .wait_timeout_while(gate.state.lock().unwrap(), Duration::from_secs(5), |s| !s.0)
+                .unwrap();
+            let entered = state.0;
+            drop(state);
+            let (reply, mut response) =
+                futures::channel::oneshot::channel::<Result<Responses, String>>();
+            sender.try_send((Requests::GetRoots, reply)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let result = loop {
+                if let Some(result) = response.try_recv().unwrap() {
+                    break Some(result);
+                }
+                if Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            *shutdown.lock().unwrap() = true;
+            gate.state.lock().unwrap().1 = true;
+            gate.changed.notify_all();
+            assert!(entered);
+            assert!(
+                result.unwrap().is_ok(),
+                "queries must finish while download is stalled"
+            );
+        });
+        p.keep_up(None, receiver).unwrap();
+        query.join().unwrap();
     }
 
     #[test]

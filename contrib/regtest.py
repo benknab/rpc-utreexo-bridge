@@ -127,7 +127,9 @@ def main():
     parser.add_argument("--bridge", default="target/debug/bridge")
     parser.add_argument("--bitcoind", default="bitcoind")
     parser.add_argument("--utreexod")
-    parser.add_argument("--rest", action="store_true", help="fetch binary blocks and headers via Core REST")
+    parser.add_argument(
+        "--rest", action="store_true", help="fetch binary blocks and headers via Core REST"
+    )
     parser.add_argument(
         "--consumer-project",
         help="limited-zk-bip-322 checkout; runs its live bridge component tests",

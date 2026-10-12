@@ -30,6 +30,7 @@ mod esplora;
 #[cfg(feature = "node")]
 mod node;
 
+mod prefetch;
 mod prover;
 
 #[cfg(feature = "shinigami")]
