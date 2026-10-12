@@ -23,6 +23,7 @@ pub struct CoreRpc {
     url: String,
     auth: Auth,
     client: RwLock<(Auth, Arc<Client>)>,
+    rest: Option<crate::core_rest::CoreRest>,
 }
 
 impl CoreRpc {
@@ -46,7 +47,13 @@ impl CoreRpc {
             url,
             auth,
             client: RwLock::new((credentials, client)),
+            rest: None,
         })
+    }
+
+    pub fn with_rest(mut self, url: &str) -> Result<Self> {
+        self.rest = Some(crate::core_rest::CoreRest::new(url)?);
+        Ok(self)
     }
 
     fn transport(url: &str, auth: Auth) -> bitcoincore_rpc::Result<Client> {
@@ -120,6 +127,12 @@ pub trait Blockchain: Send + Sync {
     fn get_transaction(&self, txid: Txid) -> Result<Transaction>;
     /// Returns the block hash of the block at the given height.
     fn get_block_hash(&self, height: u64) -> Result<BlockHash>;
+    /// Ordered active-chain hashes for bounded read-ahead. May return fewer at the tip.
+    fn get_block_hashes(&self, start: u32, count: u32) -> Result<Vec<BlockHash>> {
+        (0..count)
+            .map(|offset| self.get_block_hash(u64::from(start) + u64::from(offset)))
+            .collect()
+    }
     /// Returns the height of the block with the given hash.
     fn get_block_height(&self, block_hash: BlockHash) -> Result<u32>;
     /// Returns the block header of the block with the given hash.
@@ -132,7 +145,25 @@ pub trait Blockchain: Send + Sync {
 
 impl Blockchain for CoreRpc {
     fn get_block(&self, block_hash: BlockHash) -> Result<Block> {
+        if let Some(rest) = &self.rest {
+            return rest.get_block(block_hash);
+        }
         Ok(<Self as RpcApi>::get_block(self, &block_hash)?)
+    }
+
+    fn get_block_hashes(&self, start: u32, count: u32) -> Result<Vec<BlockHash>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(rest) = &self.rest {
+            let hash = <Self as RpcApi>::get_block_hash(self, u64::from(start))?;
+            return rest.get_block_hashes(hash, count);
+        }
+        (0..count)
+            .map(|offset| {
+                <Self as Blockchain>::get_block_hash(self, u64::from(start) + u64::from(offset))
+            })
+            .collect()
     }
 
     fn get_transaction(&self, txid: Txid) -> Result<Transaction> {

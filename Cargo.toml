@@ -42,7 +42,7 @@ reqwest = { version = "0.11.18", features = [
     "__tls",
     "__rustls",
     "rustls-tls-webpki-roots",
-], optional = true, default-features = false }
+], default-features = false }
 serde_json = { version = "1.0.128" }
 actix-cors = { version = "=0.6.5", optional = true }
 jemallocator = "0.5.4"
@@ -61,7 +61,7 @@ rand = "0.9.2"
 
 [features]
 default = ["bitcoin", "node", "api"]
-esplora = ["reqwest"]
+esplora = []
 bitcoin = []
 node = []
 api = ["actix", "actix-web", "actix-session", "actix-cors", "actix-files"]

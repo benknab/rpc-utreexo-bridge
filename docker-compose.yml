@@ -6,6 +6,7 @@ services:
     command:
       - -chain=${BITCOIN_CHAIN:-signet}
       - -server=1
+      - -rest=1
       - -txindex=0
       - -prune=0
       - -rpcport=8332
@@ -44,6 +45,7 @@ services:
       - ${CHECKPOINT_INTERVAL:-1000}
     environment:
       BITCOIN_CORE_RPC_URL: http://bitcoind:8332
+      BITCOIN_CORE_REST_URL: http://bitcoind:8332
       BITCOIN_CORE_COOKIE_FILE: /core/.bridge-cookie
       API_HOST: 0.0.0.0:3000
       P2P_HOST: 0.0.0.0

@@ -127,6 +127,7 @@ def main():
     parser.add_argument("--bridge", default="target/debug/bridge")
     parser.add_argument("--bitcoind", default="bitcoind")
     parser.add_argument("--utreexod")
+    parser.add_argument("--rest", action="store_true", help="fetch binary blocks and headers via Core REST")
     parser.add_argument(
         "--consumer-project",
         help="limited-zk-bip-322 checkout; runs its live bridge component tests",
@@ -159,6 +160,7 @@ def main():
                 f"-datadir={root / 'core'}",
                 "-regtest",
                 "-server",
+                "-rest=1",
                 "-listen=0",
                 "-connect=0",
                 "-dnsseed=0",
@@ -235,6 +237,10 @@ def main():
                 BITCOIN_CORE_RPC_PASSWORD="bridge-test",
             )
             env.pop("ESPLORA_URL", None)
+            if args.rest:
+                env["BITCOIN_CORE_REST_URL"] = core
+            else:
+                env.pop("BITCOIN_CORE_REST_URL", None)
             command = [
                 str(Path(args.bridge).resolve()),
                 "--network",

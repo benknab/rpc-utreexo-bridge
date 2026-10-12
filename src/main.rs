@@ -39,6 +39,7 @@ mod chaininterface;
 mod chainview;
 mod checkpoint;
 mod cli;
+mod core_rest;
 mod leaf_cache;
 #[cfg(not(feature = "shinigami"))]
 mod state;
@@ -127,7 +128,8 @@ fn get_chain_provider() -> Result<Box<dyn Blockchain>> {
             "Using bitcoin core at {} with username {}",
             rpc_url, username
         );
-        let client = CoreRpc::new(&rpc_url, Auth::UserPass(username, password));
+        let client =
+            CoreRpc::new(&rpc_url, Auth::UserPass(username, password)).and_then(configure_rest);
         match client {
             Ok(client) => {
                 return Ok(Box::new(client));
@@ -142,12 +144,27 @@ fn get_chain_provider() -> Result<Box<dyn Blockchain>> {
             .expect("Failed to find $HOME")
     });
     info!("Using cookie file at {}", cookie);
-    let client = CoreRpc::new(&rpc_url, Auth::CookieFile(cookie.clone().into()));
+    let client =
+        CoreRpc::new(&rpc_url, Auth::CookieFile(cookie.clone().into())).and_then(configure_rest);
     match client {
         Ok(client) => {
             info!("Using bitcoin core at {}", rpc_url);
             Ok(Box::new(client))
         }
         Err(e) => Err(anyhow::anyhow!("Couldn't connect to bitcoin core: {e}")),
+    }
+}
+
+fn configure_rest(client: CoreRpc) -> bitcoincore_rpc::Result<CoreRpc> {
+    match env::var("BITCOIN_CORE_REST_URL") {
+        Ok(url) if !url.is_empty() => {
+            info!("Using pooled binary Core REST for block downloads");
+            client.with_rest(&url).map_err(|e| {
+                bitcoincore_rpc::Error::ReturnedError(format!(
+                    "invalid Core REST configuration: {e}"
+                ))
+            })
+        }
+        _ => Ok(client),
     }
 }

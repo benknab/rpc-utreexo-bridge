@@ -31,6 +31,13 @@ Sync fetches each block by hash. It computes the parent median time from the
 eleven most recent stored headers, avoiding an extra full-block metadata RPC
 request and giving Esplora-backed leaves the same median-time data.
 
+Set `BITCOIN_CORE_REST_URL=http://bitcoind:8332` and enable Core `rest=1` to use
+pooled binary block downloads instead of hex inside JSON-RPC. RPC credentials
+are still used for control and transaction queries. REST is opt-in, fails
+explicitly if unavailable, and does not require Core 31. The Compose stack
+enables it by default. Core REST is unauthenticated; keep it on the private
+backend network. Responses are size-bounded, hash-checked, and never cached on disk.
+
 ## Processed state
 
 The processed tip is identified by **height and block hash**. Leaves, headers,
@@ -67,6 +74,7 @@ Run the supported Rust checks with `just ci`. For isolated real-node checks:
 ```sh
 cargo build --locked
 python3 contrib/regtest.py --utreexod /path/to/utreexod
+python3 contrib/regtest.py --rest --measure
 ```
 
 The harness creates temporary regtest nodes and a temporary wallet. It checks
