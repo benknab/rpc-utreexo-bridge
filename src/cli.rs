@@ -35,6 +35,14 @@ pub struct CliArgs {
     #[clap(long, default_value_t = 288)]
     pub proof_retention: u32,
 
+    /// Leaf cache budget in MiB, excluding allocator overhead (0 disables it).
+    #[clap(long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(0..=4096))]
+    pub leaf_cache_mib: u32,
+
+    /// Persistent input lookup workers (0 uses serial reads).
+    #[clap(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(0..=16))]
+    pub leaf_read_threads: u8,
+
     /// Bitcoin network (also accepts Core's main/test chain names).
     #[clap(long, short = 'n', default_value = "bitcoin", value_parser = network)]
     pub network: Network,

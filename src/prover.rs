@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Serial accumulator owner. Requests run between complete block commits.
-#[cfg(feature = "memory-leaf-map")]
-use std::collections::HashMap;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{mpsc::Sender, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -13,9 +11,9 @@ use crate::state::State;
 use anyhow::{ensure, Context, Result};
 #[cfg(feature = "api")]
 use bitcoin::consensus::serialize;
-use bitcoin::{Block, BlockHash, OutPoint, Script};
+use bitcoin::{Block, BlockHash, OutPoint, Script, Txid};
 #[cfg(feature = "api")]
-use bitcoin::{Transaction, TxOut, Txid};
+use bitcoin::{Transaction, TxOut};
 #[cfg(feature = "api")]
 use futures::channel::mpsc::Receiver;
 use log::{error, info};
@@ -55,6 +53,12 @@ pub trait BlockStorage {
 
 pub trait LeafCache {
     fn get(&self, outpoint: &OutPoint) -> Result<Option<LeafContext>>;
+    fn get_many(&self, outpoints: &[OutPoint]) -> Result<Vec<Option<LeafContext>>> {
+        outpoints.iter().map(|op| self.get(op)).collect()
+    }
+    fn stats(&self) -> crate::leaf_cache::ReadStats {
+        crate::leaf_cache::ReadStats::default()
+    }
     fn apply(&mut self, changes: &[LeafChange]);
     fn reload(&mut self, _view: &ChainView) -> Result<()> {
         Ok(())
@@ -96,6 +100,30 @@ pub struct Prover<LeafStorage: LeafCache, Storage: BlockStorage> {
     shutdown_flag: Arc<Mutex<bool>>,
     save_proofs_after: u32,
     block_notification: Sender<BlockHash>,
+    scratch: PrepareScratch,
+}
+
+#[derive(Default)]
+struct PrepareScratch {
+    txids: Vec<Txid>,
+    inputs: Vec<OutPoint>,
+    seen_txs: HashSet<Txid>,
+    spent: HashSet<OutPoint>,
+    consumed: HashSet<OutPoint>,
+    leaves: HashMap<OutPoint, Option<LeafContext>>,
+}
+
+#[derive(Default)]
+struct PrepareStats {
+    txid_us: u128,
+    input_read_us: u128,
+    output_read_us: u128,
+    leaf_hash_us: u128,
+    output_reads: usize,
+    output_skips: usize,
+    cache_hits: u64,
+    db_reads: u64,
+    db_read_us: u128,
 }
 
 struct BlockStats {
@@ -109,6 +137,7 @@ struct BlockStats {
     flush_us: u128,
     prune_us: u128,
     checkpoint_us: u128,
+    preparation: PrepareStats,
 }
 
 #[derive(Debug)]
@@ -196,6 +225,7 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
             shutdown_flag,
             save_proofs_after,
             block_notification,
+            scratch: PrepareScratch::default(),
         })
     }
 
@@ -274,6 +304,7 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
         }
     }
 
+    #[cfg(any(feature = "api", test))]
     fn lookup_leaf(&self, outpoint: &OutPoint) -> Result<LeafContext> {
         self.leaf_data
             .get(outpoint)?
@@ -391,7 +422,9 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                 info!(
                     "processed height={} txs={} adds={} dels={} leaves={} fetch_us={} \
                      prepare_us={} prove_us={} modify_us={} proof_write_us={} commit_us={} \
-                     flush_us={} prune_us={} checkpoint_us={} block_us={}",
+                     flush_us={} prune_us={} checkpoint_us={} block_us={} \
+                     txid_us={} input_read_us={} output_read_us={} leaf_hash_us={} \
+                     output_reads={} output_skips={} leaf_cache_hits={} leaf_db_reads={} leaf_db_read_us={}",
                     self.tip.height,
                     block.txdata.len(),
                     stats.adds,
@@ -407,6 +440,15 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                     stats.prune_us,
                     stats.checkpoint_us,
                     block_started.elapsed().as_micros(),
+                    stats.preparation.txid_us,
+                    stats.preparation.input_read_us,
+                    stats.preparation.output_read_us,
+                    stats.preparation.leaf_hash_us,
+                    stats.preparation.output_reads,
+                    stats.preparation.output_skips,
+                    stats.preparation.cache_hits,
+                    stats.preparation.db_reads,
+                    stats.preparation.db_read_us,
                 );
                 if self.tip.height == target {
                     let _ = self.block_notification.send(self.tip.block_hash);
@@ -475,7 +517,9 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
             block.header.prev_blockhash == self.tip.block_hash,
             "block parent mismatch"
         );
-        let delta = self.prepare(block, self.view.median_time_past(self.tip)?)?;
+        let (delta, mut preparation) =
+            self.prepare(block, self.view.median_time_past(self.tip)?)?;
+        let hash_started = Instant::now();
         let adds = delta
             .adds
             .iter()
@@ -486,6 +530,7 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
             .iter()
             .map(LeafData::get_leaf_hashes)
             .collect::<Vec<_>>();
+        preparation.leaf_hash_us = hash_started.elapsed().as_micros();
         let prepare_us = elapsed_us(&mut stage_started);
         let proof = self.acc.prove(&dels).map_err(anyhow::Error::msg)?;
         let prove_us = elapsed_us(&mut stage_started);
@@ -536,11 +581,12 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
             flush_us,
             prune_us,
             checkpoint_us,
+            preparation,
         })
     }
 
     /// Stage leaf changes without touching persistent or accumulator state.
-    fn prepare(&self, block: &Block, mtp: u32) -> Result<Delta> {
+    fn prepare(&mut self, block: &Block, mtp: u32) -> Result<(Delta, PrepareStats)> {
         let tip = Tip {
             height: self.tip.height.checked_add(1).context("height overflow")?,
             block_hash: block.block_hash(),
@@ -553,22 +599,59 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                 None
             },
         );
-        let mut changes: BTreeMap<OutPoint, LeafChange> = BTreeMap::new();
-        let mut created = Vec::new();
-        let mut consumed = HashSet::new();
-        let mut spent = HashSet::new();
-        let mut dels = Vec::new();
+        let mut stats = PrepareStats::default();
+        let reads_before = self.leaf_data.stats();
+        let scratch = &mut self.scratch;
+        scratch.txids.clear();
+        scratch.inputs.clear();
+        scratch.seen_txs.clear();
+        scratch.spent.clear();
+        scratch.consumed.clear();
+        scratch.leaves.clear();
+        scratch.txids.reserve(block.txdata.len());
+        let started = Instant::now();
         for tx in &block.txdata {
             if !tx.is_coinbase() {
                 for input in &tx.input {
                     let op = input.previous_output;
-                    ensure!(spent.insert(op), "duplicate spend in backend block");
+                    ensure!(scratch.spent.insert(op), "duplicate spend in backend block");
+                    if !scratch.seen_txs.contains(&op.txid) {
+                        scratch.inputs.push(op);
+                    }
+                }
+            }
+            let txid = tx.compute_txid();
+            scratch.txids.push(txid);
+            scratch.seen_txs.insert(txid);
+        }
+        stats.txid_us = started.elapsed().as_micros();
+        let started = Instant::now();
+        let leaves = self.leaf_data.get_many(&scratch.inputs)?;
+        ensure!(
+            leaves.len() == scratch.inputs.len(),
+            "input lookup count mismatch"
+        );
+        scratch
+            .leaves
+            .extend(scratch.inputs.iter().copied().zip(leaves));
+        stats.input_read_us = started.elapsed().as_micros();
+        let mut changes: BTreeMap<OutPoint, LeafChange> = BTreeMap::new();
+        let mut created = Vec::new();
+        let mut dels = Vec::new();
+        for (tx, txid) in block.txdata.iter().zip(scratch.txids.iter().copied()) {
+            if !tx.is_coinbase() {
+                for input in &tx.input {
+                    let op = input.previous_output;
                     let leaf = match changes.get(&op) {
                         Some(change) => change.after.clone().context("already spent in block")?,
-                        None => self.lookup_leaf(&op)?,
+                        None => scratch
+                            .leaves
+                            .remove(&op)
+                            .flatten()
+                            .context("outpoint is not unspent at processed tip")?,
                     };
                     if leaf.block_hash == tip.block_hash {
-                        consumed.insert(op);
+                        scratch.consumed.insert(op);
                     } else {
                         dels.push(leaf.clone());
                     }
@@ -582,7 +665,6 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                         .after = None;
                 }
             }
-            let txid = tx.compute_txid();
             for (vout, output) in tx.output.iter().enumerate() {
                 if Self::is_unspendable(&output.script_pubkey) {
                     continue;
@@ -602,9 +684,14 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                     is_coinbase: tx.is_coinbase(),
                 };
                 let before = if outputs_are_fresh {
+                    stats.output_skips += 1;
                     None
                 } else {
-                    self.leaf_data.get(&op)?
+                    let started = Instant::now();
+                    let before = self.leaf_data.get(&op)?;
+                    stats.output_read_us += started.elapsed().as_micros();
+                    stats.output_reads += 1;
+                    before
                 };
                 // BIP30's two historical overwrites leave the original
                 // block-bound hash in Utreexo, but replace the outpoint index.
@@ -621,16 +708,23 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
         }
         let adds = created
             .into_iter()
-            .filter(|(op, _)| !consumed.contains(op))
+            .filter(|(op, _)| !scratch.consumed.contains(op))
             .map(|(_, leaf)| leaf)
             .collect();
-        Ok(Delta {
-            tip,
-            parent: self.tip.block_hash,
-            adds,
-            dels,
-            changes: changes.into_values().collect(),
-        })
+        let reads_after = self.leaf_data.stats();
+        stats.cache_hits = reads_after.hits - reads_before.hits;
+        stats.db_reads = reads_after.reads - reads_before.reads;
+        stats.db_read_us = reads_after.db_us - reads_before.db_us;
+        Ok((
+            Delta {
+                tip,
+                parent: self.tip.block_hash,
+                adds,
+                dels,
+                changes: changes.into_values().collect(),
+            },
+            stats,
+        ))
     }
 
     fn is_unspendable(script: &Script) -> bool {
@@ -687,6 +781,45 @@ mod tests {
             357_000,
             Some(bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash())
         ));
+    }
+
+    #[test]
+    fn parallel_preparation_matches_serial_with_same_block_spends_and_missing_inputs() {
+        let dir = TestDir::new();
+        let other = TestDir::new();
+        let chain = TestChain::new();
+        let mut parallel = prover(&dir, &chain);
+        let mut serial = prover(&other, &chain);
+        serial.leaf_data = DiskLeafStorage::with_config(serial.view.clone(), 0, 0).unwrap();
+        let genesis = chain.0.read().unwrap()[0].clone();
+        let mut first = block(&genesis, 1, vec![]);
+        first.txdata[0].output = vec![first.txdata[0].output[0].clone(); 96];
+        first.header.merkle_root = first.compute_merkle_root().unwrap();
+        parallel.connect_block(&first).unwrap();
+        serial.connect_block(&first).unwrap();
+        parallel.leaf_data.reload(&parallel.view).unwrap();
+        let txid = first.txdata[0].compute_txid();
+        let mut spends: Vec<_> = (0..96)
+            .map(|vout| transaction(OutPoint { txid, vout }, vout as u8))
+            .collect();
+        let same_block = outpoint(&spends[0]);
+        spends.push(transaction(same_block, 100));
+        let second = block(&first, 2, spends);
+        parallel.connect_block(&second).unwrap();
+        serial.connect_block(&second).unwrap();
+        assert_eq!(acc_bytes(&parallel.acc), acc_bytes(&serial.acc));
+        assert_eq!(parallel.acc.leaves, serial.acc.leaves);
+        assert!(parallel.lookup_leaf(&same_block).is_err());
+        assert_eq!(parallel.view.delta(2).unwrap().unwrap().dels.len(), 96);
+        let before = acc_bytes(&parallel.acc);
+        let missing = block(
+            &second,
+            3,
+            vec![transaction(OutPoint { txid, vout: 999 }, 101)],
+        );
+        assert!(parallel.connect_block(&missing).is_err());
+        assert_eq!(acc_bytes(&parallel.acc), before);
+        assert_eq!(parallel.view.tip().unwrap().unwrap().height, 2);
     }
 
     #[test]
@@ -756,6 +889,7 @@ mod tests {
             shutdown_flag: Arc::new(Mutex::new(false)),
             save_proofs_after: u32::MAX,
             block_notification: std::sync::mpsc::channel().0,
+            scratch: PrepareScratch::default(),
         }
     }
 

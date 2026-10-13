@@ -78,7 +78,11 @@ pub fn run_bridge() -> anyhow::Result<()> {
     );
 
     // Process backend blocks and retain only derived state and recent proofs.
-    let leaf_data = DiskLeafStorage::new(view.clone());
+    let leaf_data = DiskLeafStorage::with_config(
+        view.clone(),
+        usize::try_from(u64::from(cli_options.leaf_cache_mib) * 1024 * 1024)?,
+        cli_options.leaf_read_threads as usize,
+    )?;
 
     // a signal used to stop the prover
     let kill_signal = Arc::new(Mutex::new(false));

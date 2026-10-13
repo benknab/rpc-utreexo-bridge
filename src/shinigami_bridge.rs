@@ -74,7 +74,11 @@ pub fn run_bridge() -> anyhow::Result<()> {
     // node and save them to disk. It will also create proofs for the blocks
     // and save them to disk.
     #[cfg(not(feature = "memory-leaf-map"))]
-    let leaf_data = DiskLeafStorage::new(view.clone());
+    let leaf_data = DiskLeafStorage::with_config(
+        view.clone(),
+        usize::try_from(u64::from(cli_options.leaf_cache_mib) * 1024 * 1024)?,
+        cli_options.leaf_read_threads as usize,
+    )?;
 
     #[cfg(feature = "memory-leaf-map")]
     let leaf_data = HashMap::new();

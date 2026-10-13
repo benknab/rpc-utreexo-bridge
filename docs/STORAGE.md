@@ -45,6 +45,24 @@ are queued and one is being downloaded. Reorgs discard queued work, and the owne
 checks each block's hash, height, and parent before applying it. `--stop-height`
 also caps read-ahead. A stalled downloader does not hold up witness requests.
 
+Leaf preparation uses `--leaf-read-threads 4` persistent workers for blocks with
+at least 64 external inputs. Set it to `0` for serial reads (maximum 16). Workers
+read one stable pre-block view, omit same-block spends, and finish before the
+owner modifies the accumulator or commits the database. Prepared blocks still
+apply strictly in chain order.
+
+`--leaf-cache-mib 128` adds a bounded read-through coin cache in front of Sled;
+`0` disables it. The budget covers fixed slots and owned script bytes, excluding
+allocator overhead. Hash collisions evict entries rather than expanding the
+cache. New outputs enter only after commit, spends invalidate entries, and
+reorg recovery clears the cache. Sled's separate default 1 GiB cache remains in
+use. The database and on-disk formats are unchanged.
+
+On the chain anchored by mainnet's BIP34 activation block, new-output existence
+reads are skipped above height 227931 and below 1983702, following Core's BIP30
+optimization. Other networks, unanchored forks, and earlier history retain the
+conservative reads and historical overwrite undo data.
+
 ## Processed state
 
 The processed tip is identified by **height and block hash**. Leaves, headers,
@@ -151,6 +169,13 @@ processing. `block_us` measures the owner's current receive/processing iteration
 do not sum overlapping stage timings to infer wall time. Checkpoint time includes snapshot publication and
 journal pruning. Separate log lines report checkpoint size and restore time.
 `leaves` counts all accumulator insertions, including later spent leaves.
+
+Preparation also reports `txid_us` (transaction IDs and input discovery),
+`input_read_us`, `output_read_us`, and `leaf_hash_us`. These are subsets of
+`prepare_us`, not additional stages. `leaf_cache_hits`, `leaf_db_reads`,
+`output_reads`, and `output_skips` count the block's lookup activity.
+`leaf_db_read_us` sums DB read time across workers and can exceed input-read
+wall time; do not add it to elapsed processing time.
 
 Record the Core version, backend location, CPU/RAM/disk, height range, and whether
 the filesystem cache was warm alongside results. Compare identical block ranges
