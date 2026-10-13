@@ -127,6 +127,19 @@ fn elapsed_us(since: &mut Instant) -> u128 {
     elapsed
 }
 
+// Match Core's anchored mainnet BIP34 optimization, including its upper bound.
+// Other networks and pre-activation/fork histories keep the conservative reads.
+const BIP34_HEIGHT: u32 = 227_931;
+fn fresh_outputs(height: u32, activation_hash: Option<BlockHash>) -> bool {
+    (BIP34_HEIGHT + 1..1_983_702).contains(&height)
+        && activation_hash
+            == Some(
+                "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
+                    .parse()
+                    .expect("mainnet BIP34 hash"),
+            )
+}
+
 impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -532,6 +545,14 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
             height: self.tip.height.checked_add(1).context("height overflow")?,
             block_hash: block.block_hash(),
         };
+        let outputs_are_fresh = fresh_outputs(
+            tip.height,
+            if tip.height > BIP34_HEIGHT {
+                self.view.get_block_hash(BIP34_HEIGHT)?
+            } else {
+                None
+            },
+        );
         let mut changes: BTreeMap<OutPoint, LeafChange> = BTreeMap::new();
         let mut created = Vec::new();
         let mut consumed = HashSet::new();
@@ -580,7 +601,11 @@ impl<L: LeafCache, S: BlockStorage> Prover<L, S> {
                     median_time_past: mtp,
                     is_coinbase: tx.is_coinbase(),
                 };
-                let before = self.leaf_data.get(&op)?;
+                let before = if outputs_are_fresh {
+                    None
+                } else {
+                    self.leaf_data.get(&op)?
+                };
                 // BIP30's two historical overwrites leave the original
                 // block-bound hash in Utreexo, but replace the outpoint index.
                 changes
@@ -645,6 +670,52 @@ mod tests {
     use super::*;
     use crate::leaf_cache::DiskLeafStorage;
     use crate::test_support::{block, outpoint, store, transaction, TestChain, TestDir};
+
+    #[test]
+    fn output_lookup_elision_requires_the_anchor_and_height_bounds() {
+        let anchor = Some(
+            "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
+                .parse()
+                .unwrap(),
+        );
+        assert!(!fresh_outputs(227_931, anchor));
+        assert!(fresh_outputs(227_932, anchor));
+        assert!(fresh_outputs(1_983_701, anchor));
+        assert!(!fresh_outputs(1_983_702, anchor));
+        assert!(!fresh_outputs(357_000, None));
+        assert!(!fresh_outputs(
+            357_000,
+            Some(bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash())
+        ));
+    }
+
+    #[test]
+    fn historical_output_overwrite_retains_undo_and_both_forest_leaves() {
+        let dir = TestDir::new();
+        let chain = TestChain::new();
+        let mut p = prover(&dir, &chain);
+        let first = block(&chain.0.read().unwrap()[0], 1, vec![]);
+        chain.0.write().unwrap().push(first.clone());
+        p.connect_block(&first).unwrap();
+        let op = outpoint(&first.txdata[0]);
+        let original = p.lookup_leaf(&op).unwrap();
+        let mut repeat = block(&first, 2, vec![]);
+        repeat.txdata = first.txdata.clone();
+        repeat.header.merkle_root = repeat.compute_merkle_root().unwrap();
+        chain.0.write().unwrap().push(repeat.clone());
+        p.connect_block(&repeat).unwrap();
+        assert_eq!(p.lookup_leaf(&op).unwrap().block_hash, repeat.block_hash());
+        p.acc
+            .prove(&[LeafData::get_leaf_hashes(&original)])
+            .unwrap();
+        assert_eq!(
+            p.view.delta(2).unwrap().unwrap().changes[0].before,
+            Some(original.clone())
+        );
+        chain.0.write().unwrap().pop();
+        p.reconcile(1).unwrap();
+        assert_eq!(p.lookup_leaf(&op).unwrap(), original);
+    }
 
     struct NoBlocks;
     impl BlockStorage for NoBlocks {

@@ -362,6 +362,8 @@ impl From<Block> for UtreexoBlock {
 
 #[cfg(not(feature = "shinigami"))]
 pub mod bitcoin_leaf_data {
+    use std::sync::OnceLock;
+
     use bitcoin::consensus::Decodable;
     use bitcoin::consensus::Encodable;
     use bitcoin::Amount;
@@ -412,23 +414,64 @@ pub mod bitcoin_leaf_data {
 
     impl BitcoinLeafData {
         pub fn get_leaf_hashes(leaf: &LeafContext) -> BitcoinNodeHash {
-            let leaf_data = BitcoinLeafData::from(leaf.clone());
-            leaf_data.compute_hash()
-        }
-
-        fn compute_hash(&self) -> BitcoinNodeHash {
-            let mut ser_utxo = vec![];
-            let _ = self.utxo.consensus_encode(&mut ser_utxo);
-            let leaf_hash = Sha512_256::new()
-                .chain_update(UTREEXO_TAG_V1)
-                .chain_update(UTREEXO_TAG_V1)
-                .chain_update(self.block_hash)
-                .chain_update(self.prevout.txid)
-                .chain_update(self.prevout.vout.to_le_bytes())
-                .chain_update(self.header_code.to_le_bytes())
-                .chain_update(ser_utxo)
+            // The two tags fill one SHA-512 block. Reuse its midstate and
+            // stream the consensus fields without cloning or allocating scripts.
+            static TAGGED: OnceLock<Sha512_256> = OnceLock::new();
+            let engine = TAGGED.get_or_init(|| {
+                Sha512_256::new()
+                    .chain_update(UTREEXO_TAG_V1)
+                    .chain_update(UTREEXO_TAG_V1)
+            });
+            let mut length = [0u8; 9];
+            let size = bitcoin::VarInt(leaf.pk_script.len() as u64)
+                .consensus_encode(&mut &mut length[..])
+                .expect("CompactSize fits in nine bytes");
+            let leaf_hash = engine
+                .clone()
+                .chain_update(leaf.block_hash)
+                .chain_update(leaf.txid)
+                .chain_update(leaf.vout.to_le_bytes())
+                .chain_update(
+                    ((leaf.block_height << 1) | u32::from(leaf.is_coinbase)).to_le_bytes(),
+                )
+                .chain_update(leaf.value.to_le_bytes())
+                .chain_update(&length[..size])
+                .chain_update(leaf.pk_script.as_bytes())
                 .finalize();
             BitcoinNodeHash::from(leaf_hash.as_slice())
+        }
+    }
+
+    #[cfg(test)]
+    mod hash_tests {
+        use super::*;
+        use bitcoin::{consensus::serialize, hashes::Hash, ScriptBuf, Txid};
+
+        #[test]
+        fn streamed_hash_matches_consensus_at_compact_size_boundaries() {
+            for size in [0, 25, 252, 253, 10_000, 65_535, 65_536] {
+                for is_coinbase in [false, true] {
+                    let leaf = LeafContext {
+                        block_hash: BlockHash::from_byte_array([1; 32]),
+                        txid: Txid::from_byte_array([2; 32]),
+                        vout: 513,
+                        value: 5_000_000_000,
+                        pk_script: ScriptBuf::from_bytes(vec![0x51; size]),
+                        block_height: 357_000,
+                        median_time_past: 1234,
+                        is_coinbase,
+                    };
+                    let expected = Sha512_256::new()
+                        .chain_update(UTREEXO_TAG_V1)
+                        .chain_update(UTREEXO_TAG_V1)
+                        .chain_update(serialize(&BitcoinLeafData::from(leaf.clone())))
+                        .finalize();
+                    assert_eq!(
+                        BitcoinLeafData::get_leaf_hashes(&leaf),
+                        BitcoinNodeHash::from(expected.as_slice())
+                    );
+                }
+            }
         }
     }
 
