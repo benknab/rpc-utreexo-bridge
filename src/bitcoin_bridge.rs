@@ -44,14 +44,14 @@ pub fn run_bridge() -> anyhow::Result<()> {
         temporary: false,
         use_compression: false,
         flush_every_ms: None,
-        cache_capacity: None,
+        cache_capacity: Some(u64::from(cli_options.db_cache_mib) * 1024 * 1024),
         segment_size: None,
     })
     .expect("Failed to open chainview database");
 
     // Chainview is a collection of metadata about the chain, like tip and block
     // indexes. It's stored in a key-value database.
-    let view = chainview::ChainView::new(store);
+    let view = chainview::ChainView::new(store)?;
     let view = Arc::new(view);
 
     let network = cli_options.network;

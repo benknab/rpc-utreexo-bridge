@@ -869,7 +869,7 @@ mod tests {
     }
 
     fn prover(dir: &TestDir, chain: &TestChain) -> Prover<DiskLeafStorage, NoBlocks> {
-        let view = Arc::new(ChainView::new(store(&dir.join("chain"))));
+        let view = Arc::new(ChainView::new(store(&dir.join("chain"))).unwrap());
         view.initialize(chain.0.read().unwrap()[0].header).unwrap();
         let tip = view.tip().unwrap().unwrap();
         let checkpoints = Checkpoints::new(dir.join("checkpoints")).unwrap();
@@ -986,6 +986,61 @@ mod tests {
                 p.view.get_acc(p.tip.block_hash).unwrap().unwrap()
             );
         }
+    }
+
+    #[test]
+    fn migrate_mixed_journal_then_replay_and_reorg_without_resync() {
+        let dir = TestDir::new();
+        let chain = TestChain::new();
+        let genesis = chain.0.read().unwrap()[0].clone();
+        let first = block(&genesis, 1, vec![]);
+        let coin = outpoint(&first.txdata[0]);
+        let second = block(&first, 2, vec![transaction(coin, 20)]);
+        let third = block(&second, 3, vec![]);
+        let mut p = prover(&dir, &chain);
+        for next in [&first, &second, &third] {
+            chain.0.write().unwrap().push(next.clone());
+            p.connect_block(next).unwrap();
+        }
+        let expected = acc_bytes(&p.acc);
+        let deltas: Vec<_> = [1, 3].map(|h| p.view.delta(h).unwrap().unwrap()).into();
+        drop(p);
+        // Height 2 is already migrated. Heights 1 and 3 still use the deployed
+        // inline-JSON format, as after an interrupted upgrade.
+        let storage = store(&dir.join("chain"));
+        let bucket = storage
+            .bucket::<Vec<u8>, Vec<u8>>(Some("bridge-v2"))
+            .unwrap();
+        for delta in deltas {
+            let mut key = vec![b'j'];
+            key.extend_from_slice(&delta.tip.height.to_be_bytes());
+            bucket
+                .set(&key, &serde_json::to_vec(&delta).unwrap())
+                .unwrap();
+            bucket.flush().unwrap();
+            std::fs::remove_file(dir.join(&format!(
+                "chain/journal/{:010}-{}.json",
+                delta.tip.height, delta.tip.block_hash
+            )))
+            .unwrap();
+        }
+        drop(bucket);
+        drop(storage);
+        let mut p = prover(&dir, &chain);
+        assert_eq!(p.tip.block_hash, third.block_hash());
+        assert_eq!(acc_bytes(&p.acc), expected);
+        assert!(p.lookup_leaf(&coin).is_err());
+        chain.0.write().unwrap().truncate(2);
+        p.reconcile(1).unwrap();
+        let hash = LeafData::get_leaf_hashes(&p.lookup_leaf(&coin).unwrap());
+        assert!(p
+            .acc
+            .verify(&p.acc.prove(&[hash]).unwrap(), &[hash])
+            .unwrap());
+        drop(p);
+        let p = prover(&dir, &chain);
+        assert_eq!(p.tip.block_hash, first.block_hash());
+        assert!(p.lookup_leaf(&coin).is_ok());
     }
 
     #[cfg(feature = "api")]

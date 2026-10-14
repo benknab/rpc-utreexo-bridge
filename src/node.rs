@@ -2536,7 +2536,7 @@ mod tests {
                 ProofStore::new(root.join("proofs"), 288).expect("open test proofs"),
             )),
             block_backend: Arc::new(crate::test_support::TestChain::new()),
-            chainview: Arc::new(ChainView::new(store("chainview"))),
+            chainview: Arc::new(ChainView::new(store("chainview")).unwrap()),
             magic: Magic::REGTEST,
         }
     }

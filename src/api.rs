@@ -541,7 +541,7 @@ mod tests {
     #[actix_web::test]
     async fn historical_resources_decode_state_and_reject_disconnected_blocks() {
         let dir = TestDir::new();
-        let view = Arc::new(ChainView::new(store(&dir.join("chain"))));
+        let view = Arc::new(ChainView::new(store(&dir.join("chain"))).unwrap());
         let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
         view.initialize(genesis.header).unwrap();
         let first = block(&genesis, 1, vec![]);

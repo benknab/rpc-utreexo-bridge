@@ -41,6 +41,7 @@ mod chainview;
 mod checkpoint;
 mod cli;
 mod core_rest;
+mod journal;
 mod leaf_cache;
 #[cfg(not(feature = "shinigami"))]
 mod state;

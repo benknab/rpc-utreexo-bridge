@@ -39,6 +39,10 @@ pub struct CliArgs {
     #[clap(long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(0..=4096))]
     pub leaf_cache_mib: u32,
 
+    /// Sled page-cache target in MiB (not a process memory limit).
+    #[clap(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    pub db_cache_mib: u32,
+
     /// Persistent input lookup workers (0 uses serial reads).
     #[clap(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(0..=16))]
     pub leaf_read_threads: u8,

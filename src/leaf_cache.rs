@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn parallel_reads_match_serial_and_cache_tracks_commit_and_undo() {
         let dir = TestDir::new();
-        let view = Arc::new(ChainView::new(store(&dir.join("chain"))));
+        let view = Arc::new(ChainView::new(store(&dir.join("chain"))).unwrap());
         let chain = TestChain::new();
         let genesis = chain.0.read().unwrap()[0].clone();
         view.initialize(genesis.header).unwrap();
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn disconnected_reader_returns_an_error_after_draining_other_workers() {
         let dir = TestDir::new();
-        let view = Arc::new(ChainView::new(store(&dir.join("chain"))));
+        let view = Arc::new(ChainView::new(store(&dir.join("chain"))).unwrap());
         let mut storage = DiskLeafStorage::with_config(view, 0, 2).unwrap();
         let (sender, receiver) = mpsc::sync_channel(1);
         drop(receiver);

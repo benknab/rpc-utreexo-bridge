@@ -55,8 +55,9 @@ apply strictly in chain order.
 `0` disables it. The budget covers fixed slots and owned script bytes, excluding
 allocator overhead. Hash collisions evict entries rather than expanding the
 cache. New outputs enter only after commit, spends invalidate entries, and
-reorg recovery clears the cache. Sled's separate default 1 GiB cache remains in
-use. The database and on-disk formats are unchanged.
+reorg recovery clears the cache. `--db-cache-mib 64` sets Sled's separate page-cache
+target. This is not a process RSS limit: Sled metadata, allocator overhead, and
+the full in-memory accumulator also consume memory.
 
 On the chain anchored by mainnet's BIP34 activation block, new-output existence
 reads are skipped above height 227931 and below 1983702, following Core's BIP30
@@ -66,9 +67,17 @@ conservative reads and historical overwrite undo data.
 ## Processed state
 
 The processed tip is identified by **height and block hash**. Leaves, headers,
-historical accumulator states, and recovery deltas are published in one atomic
-database batch per block. REST proof queries execute between those batches and
-never consume leaf data.
+historical accumulator states, and small recovery-file references are published
+in one atomic database batch per block. REST proof queries execute between those
+batches and never consume leaf data.
+
+Recovery deltas are streamed into `chain_view/journal/<height>-<hash>.json`.
+The file and its directory entry are synced before the database publishes the
+72-byte reference (version, block hash, SHA-256 checksum) together with the leaf
+changes and tip. The database tip is the commit point. An interrupted write
+before that point leaves an orphan file, not a partially accepted block.
+Payloads never enter Sled's blob cache. Reading/replaying uses one delta at a
+time; retained journal length does not determine its live heap size.
 
 `--acc-snapshot-every-n-blocks` defaults to 1000. The bridge keeps the two most
 recent forest checkpoints and the replay/undo deltas after the older checkpoint.
@@ -80,7 +89,38 @@ Historical roots are retained separately from this bounded recovery data.
 On restart, the bridge loads a checkpoint and replays committed deltas, checking
 the roots after every replayed block. A shutdown snapshot is not required. Forest
 snapshots are atomically renamed only after the corresponding database state is
-durable; journal pruning happens after checkpoint publication.
+durable; journal pruning happens after checkpoint publication. Pruning removes
+references in batches of at most 64, flushes the database, then unlinks their
+files. Disconnecting a block similarly flushes the rolled-back tip and leaves
+before unlinking its undo file. Startup removes temporary and unreferenced files,
+so interrupted commits, pruning, and reorgs are restartable.
+
+The durable-tip approach is also used by
+[electrs v0.10.10](https://github.com/romanz/electrs/blob/v0.10.10/src/index.rs).
+Electrs indexes compact candidate rows; the bridge additionally needs replay/undo
+records to restore its mutable accumulator and exact UTXO membership.
+
+### Upgrading an existing bridge-v2 directory
+
+No resync is needed for the split-storage format. Before restoring the forest,
+startup migrates old Sled JSON deltas one record at a time. Each file is durable
+before its old database value is replaced by a reference. An interruption can
+leave a mixture of formats; startup resumes migration safely. The leaf index,
+proofs, roots, and checkpoints keep their existing formats. Older bridge binaries
+cannot read the new journal references; do not downgrade a migrated directory.
+
+Previously, large JSON deltas occupied Sled blobs whose cache weight reflected
+the small on-log pointer rather than the full loaded payload. Bulk journal
+deletion also deferred memory reclamation across the entire batch. Moving those
+payloads out of Sled and bounding deletion batches removes that retention path.
+Sled also retires pages through Crossbeam's epoch collector. A large atomic batch
+pins that collector once while retiring many pages; automatic collection is tied
+to pin frequency rather than batch size. After every database batch the bridge
+explicitly performs collection work proportional to its writes, using fresh
+guards so epochs can advance. This prevents a growing queue of retired pages;
+concurrent readers retain Crossbeam's normal protection.
+This does not make `MemForest` a bounded-memory accumulator: mainnet capacity
+must still account for the growing UTXO forest and its hash index.
 
 ## Upgrade from legacy storage
 
@@ -101,6 +141,33 @@ cargo build --locked
 python3 contrib/regtest.py --utreexod /path/to/utreexod
 python3 contrib/regtest.py --rest --measure
 ```
+
+For the isolated large-journal memory regression (run alone, not alongside other
+tests):
+
+```sh
+cargo test --release journal_memory -- --ignored --nocapture
+BRIDGE_JOURNAL_STRESS_LEGACY=1 cargo test --release journal_memory -- --ignored --nocapture
+cargo test --release batch_memory -- --ignored --nocapture
+BRIDGE_BATCH_STRESS_LEGACY=1 cargo test --release batch_memory -- --ignored --nocapture
+```
+
+Both runs retain the same 128 large recovery records with a 1 MiB Sled cache.
+The first checks that RSS growth stays below 64 MiB after warmup, before pruning
+and after replay/pruning. The second reproduces the previous blob-based strategy
+for comparison. This isolates journal memory from accumulator size. Unit tests
+also exit child processes without destructors at file publication, tip commit,
+undo, pruning, and migration boundaries and verify recovery after reopening.
+
+On macOS, an optimized run on 2026-10-13 retained 131 MiB of journal payloads:
+the file-backed path used 35 MiB RSS (36 MiB after replay and pruning), while the
+old Sled path used 185 MiB and grew with the retained payloads. Both used the same
+1 MiB cache target. This is a journal regression check, not a full-mainnet memory
+budget measurement.
+
+The separate batch regression inserts 128 batches of 4,096 small records into a
+1 MiB Sled cache. It isolates deferred page reclamation from large journal blobs
+and accumulator memory. Its legacy control omits explicit epoch collection.
 
 The harness creates temporary regtest nodes and a temporary wallet. It checks
 leaf, root, proof, and target parity against Utreexod; membership at an earlier
